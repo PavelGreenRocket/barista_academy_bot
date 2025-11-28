@@ -16,6 +16,10 @@ const {
   hasUnreadNotification,
 } = require("./bot/notifications");
 const { registerAssistant } = require("./bot/assistant");
+const {
+  registerInternship,
+  hasActiveInternshipSessionForTrainer,
+} = require("./bot/internship");
 
 const { deliver } = require("./utils/renderHelpers");
 
@@ -56,7 +60,6 @@ async function ensureUser(ctx) {
 }
 
 // показ главного меню
-// показ главного меню
 async function showMainMenu(ctx) {
   const user = await ensureUser(ctx);
   const isAdmin = user?.role === "admin";
@@ -65,26 +68,43 @@ async function showMainMenu(ctx) {
 
   const keyboard = [];
 
-  // уведомление, если есть непрочитанное
+  // уведомление...
   const hasNotif = await hasUnreadNotification(user.id);
-  if (hasNotif) {
-    keyboard.push([
-      Markup.button.callback(
-        "🔔 Уведомление (НАЖМИ)!!!",
-        "user_notification_open"
-      ),
-    ]);
-  }
+  const notifLabel = hasNotif ? "🔔‿🔔 НОВОЕ УВЕДОМЛЕНИЕ❗" : "🔔 уведомления";
+
+  keyboard.push([Markup.button.callback(notifLabel, "user_notification_open")]);
 
   keyboard.push([Markup.button.callback("📚 Теория", "user_theory")]);
   keyboard.push([Markup.button.callback("🎯 Тренировки", "user_train")]);
-
-  // ❓ новая кнопка — вопрос к ассистенту
   keyboard.push([
     Markup.button.callback("❓ Вопрос по обучению", "user_ask_question"),
   ]);
-
   keyboard.push([Markup.button.callback("✅ Аттестация", "user_attest")]);
+
+  if (isAdmin) {
+    const hasInternship = await hasActiveInternshipSessionForTrainer(user.id);
+    if (hasInternship) {
+      keyboard.push([
+        Markup.button.callback(
+          "🧑‍🏫 Процесс стажировки",
+          "internship_active_menu"
+        ),
+      ]);
+    }
+  }
+
+  // 👉 добавляем кнопку процесса стажировки, если у админа есть активная сессия
+  if (isAdmin) {
+    const hasInternship = await hasActiveInternshipSessionForTrainer(user.id);
+    if (hasInternship) {
+      keyboard.push([
+        Markup.button.callback(
+          "🧑‍🏫 Процесс стажировки",
+          "internship_active_menu"
+        ),
+      ]);
+    }
+  }
 
   if (isAdmin) {
     keyboard.push([Markup.button.callback("🛠 Админ-панель", "admin_menu")]);
@@ -105,8 +125,9 @@ registerTrain(bot, ensureUser, logError);
 registerAttest(bot, ensureUser, logError);
 registerAdminUsers(bot, ensureUser, logError);
 registerInstructions(bot, ensureUser, logError);
-registerNotifications(bot, ensureUser, logError);
+registerNotifications(bot, ensureUser, logError, showMainMenu);
 registerAssistant(bot, ensureUser, logError);
+registerInternship(bot, ensureUser, logError, showMainMenu);
 
 // ----- Команды и кнопки для всех пользователей -----
 

@@ -9,6 +9,7 @@ console.log(
 );
 console.log("GIGACHAT_SCOPE =", process.env.GIGACHAT_SCOPE);
 console.log("GIGACHAT_MODEL =", process.env.GIGACHAT_MODEL);
+const pool = require("../db/pool");
 const { getRelevantChunks } = require("./knowledge");
 const { Agent } = require("node:https");
 
@@ -59,7 +60,7 @@ async function getAssistantAnswer(question) {
           "Ты — наставник по обучению бариста в кофейне. " +
           "Отвечай строго на основе приведённых ниже фрагментов учебной базы. " +
           "Не выдумывай факты, которых там нет. если сомневаешься в ответе, к своему ответу можешь приложить контакты  менедежера по качеству либо старшего администратора, в зависимости от вопроса " +
-          "Если информации недостаточно, честно скажи, что по базе нет точного ответа. и дай контакты  менедежера по качеству либо главному администратору, в зависимости от вопроса"  + 
+          "Если информации недостаточно, честно скажи, что по базе нет точного ответа. и дай контакты  менедежера по качеству либо главному администратору, в зависимости от вопроса" +
           "Если вопрос связан с качеством, техникой приготовления (например приготовление напитков), правилами сервиса, или с теоретической базой, в случае если нет подходящего ответа, можно обратится к менеджеру по качеству +7 913 457 5883 (Шах), По всем другим вопросам к клавному администратору @k0nfe11ka (Ярославе).",
       },
       {
@@ -151,6 +152,32 @@ function registerAssistant(bot, ensureUser, logError) {
         );
         return;
       }
+
+      // ---- ЛОГИРУЕМ ОБЩЕНИЕ С ИИ ----
+      try {
+        // user мы уже получили в начале handler'а: const user = await ensureUser(ctx);
+        await pool.query(
+          `
+          INSERT INTO ai_chat_logs (user_id, question, answer)
+          VALUES ($1, $2, $3)
+          `,
+          [user.id, question, answer]
+        );
+
+        // оставляем в таблице только 20 последних записей (глобально)
+        await pool.query(`
+          DELETE FROM ai_chat_logs
+          WHERE id NOT IN (
+            SELECT id
+            FROM ai_chat_logs
+            ORDER BY created_at DESC
+            LIMIT 20
+          )
+        `);
+      } catch (err) {
+        logError("ai_chat_logs_insert", err);
+      }
+      // ---- КОНЕЦ ЛОГИРОВАНИЯ ----
 
       const keyboard = Markup.inlineKeyboard([
         [Markup.button.callback("❓ Задать ещё вопрос", "user_ask_question")],

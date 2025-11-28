@@ -56,8 +56,13 @@ async function getUserTrainLevelInfo(userId) {
 
 // ---------- ВСПОМОГАТЕЛЬНЫЕ ЭКРАНЫ ----------
 
-async function showTrainMenu(ctx, userId) {
-  const levelInfo = await getUserTrainLevelInfo(targetUserId);
+// ---------- ВСПОМОГАТЕЛЬНЫЕ ЭКРАНЫ ----------
+
+async function showTrainMenu(ctx, userId, targetUserId = null) {
+  // реальный пользователь, для которого смотрим уровень
+  const realUserId = targetUserId ?? userId;
+
+  const levelInfo = await getUserTrainLevelInfo(realUserId);
 
   const text =
     "🎯 Тренировки\n" +
@@ -76,6 +81,7 @@ async function showTrainMenu(ctx, userId) {
 
   await deliver(ctx, { text, extra: keyboard }, { edit: true });
 }
+
 
 async function getTopics() {
   const res = await pool.query(

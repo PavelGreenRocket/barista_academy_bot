@@ -24,6 +24,43 @@ async function hasUnreadNotification(userId) {
 }
 
 /**
+ * Получить все непрочитанные уведомления пользователя
+ */
+async function getUnreadNotifications(userId) {
+  const res = await pool.query(
+    `
+      SELECT n.id, n.text, n.created_at
+      FROM notifications n
+      JOIN user_notifications un
+        ON un.notification_id = n.id
+      WHERE un.user_id = $1 AND un.is_read = FALSE
+      ORDER BY n.created_at ASC
+    `,
+    [userId]
+  );
+  return res.rows;
+}
+
+/**
+ * История уведомлений пользователя (последние N)
+ */
+async function getUserNotificationsHistory(userId, limit = 10) {
+  const res = await pool.query(
+    `
+      SELECT n.id, n.text, n.created_at
+      FROM notifications n
+      JOIN user_notifications un
+        ON un.notification_id = n.id
+      WHERE un.user_id = $1
+      ORDER BY n.created_at DESC
+      LIMIT $2
+    `,
+    [userId, limit]
+  );
+  return res.rows;
+}
+
+/**
  * Получить последнее непрочитанное уведомление пользователя
  */
 async function getLastUnreadNotification(userId) {
@@ -48,10 +85,17 @@ async function getLastUnreadNotification(userId) {
 async function showUserNotification(ctx, ensureUser, logError) {
   try {
     const user = await ensureUser(ctx);
-    const row = await getLastUnreadNotification(user.id);
+    const unread = await getUnreadNotifications(user.id);
 
-    if (!row) {
+    // нет новых — сразу предложим историю
+    if (!unread.length) {
       const keyboard = Markup.inlineKeyboard([
+        [
+          Markup.button.callback(
+            "📜 История уведомлений",
+            "user_notification_history"
+          ),
+        ],
         [Markup.button.callback("🔙 В меню", "back_main")],
       ]);
 
@@ -66,20 +110,26 @@ async function showUserNotification(ctx, ensureUser, logError) {
       return;
     }
 
-    const date = row.created_at.toLocaleString("ru-RU", {
-      day: "2-digit",
-      month: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+    // есть одно или несколько непрочитанных
+    let text = "🔔 Новые уведомления:\n\n";
 
-    const text = `🔔 Уведомление от ${date}:\n\n` + row.text;
+    for (const row of unread) {
+      const date = row.created_at.toLocaleString("ru-RU", {
+        day: "2-digit",
+        month: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+
+      text += `${date} → ${row.text}\n\n`;
+    }
 
     const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback("✅ Прочитал", "user_notification_read_all")],
       [
         Markup.button.callback(
-          "✅ ПРОЧИТАЛ",
-          `user_notification_read_${row.id}`
+          "📜 История уведомлений",
+          "user_notification_history"
         ),
       ],
     ]);
@@ -87,15 +137,64 @@ async function showUserNotification(ctx, ensureUser, logError) {
     await deliver(ctx, { text, extra: keyboard }, { edit: true });
   } catch (err) {
     logError("showUserNotification", err);
-    await ctx.reply("Не удалось показать уведомление.");
+    await ctx.reply("Не удалось показать уведомления.");
   }
 }
 
 /**
  * Регистрация всех хендлеров уведомлений
  */
-function registerNotifications(bot, ensureUser, logError) {
+function registerNotifications(bot, ensureUser, logError, showMainMenu) {
   // --- ADMIN: меню рассылки ---
+
+  // --- USER: история уведомлений ---
+
+  bot.action("user_notification_history", async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const user = await ensureUser(ctx);
+
+      const rows = await getUserNotificationsHistory(user.id, 10);
+
+      if (!rows.length) {
+        const keyboard = Markup.inlineKeyboard([
+          [Markup.button.callback("🔙 В меню", "back_main")],
+        ]);
+
+        await deliver(
+          ctx,
+          {
+            text: "У тебя пока нет уведомлений.",
+            extra: keyboard,
+          },
+          { edit: true }
+        );
+        return;
+      }
+
+      let text = "📜 История уведомлений (последние 10):\n\n";
+
+      for (const row of rows) {
+        const date = row.created_at.toLocaleString("ru-RU", {
+          day: "2-digit",
+          month: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+
+        text += `${date} → ${row.text}\n\n`;
+      }
+
+      const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback("🔙 В меню", "back_main")],
+      ]);
+
+      await deliver(ctx, { text, extra: keyboard }, { edit: true });
+    } catch (err) {
+      logError("user_notification_history", err);
+      await ctx.reply("Не удалось показать историю уведомлений.");
+    }
+  });
 
   bot.action("admin_broadcast_menu", async (ctx) => {
     try {
@@ -155,7 +254,6 @@ function registerNotifications(bot, ensureUser, logError) {
     }
   });
 
-  // Админ смотрит статус последнего уведомления
   // Админ смотрит статус последнего уведомления
   bot.action("admin_broadcast_status", async (ctx) => {
     try {
@@ -353,6 +451,30 @@ function registerNotifications(bot, ensureUser, logError) {
     } catch (err) {
       logError("user_notification_read", err);
       await ctx.reply("Не удалось отметить уведомление.");
+    }
+  });
+
+  // --- USER: отметить ВСЕ непрочитанные как прочитанные ---
+
+  bot.action("user_notification_read_all", async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const user = await ensureUser(ctx);
+
+      await pool.query(
+        `
+          UPDATE user_notifications
+          SET is_read = TRUE, read_at = NOW()
+          WHERE user_id = $1 AND is_read = FALSE
+        `,
+        [user.id]
+      );
+
+      // после этого возвращаем пользователя в главное меню
+      await showMainMenu(ctx);
+    } catch (err) {
+      logError("user_notification_read_all", err);
+      await ctx.reply("Не удалось отметить уведомления как прочитанные.");
     }
   });
 }

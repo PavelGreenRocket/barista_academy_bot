@@ -24,10 +24,9 @@ function clearState(userId) {
 async function showAdminMenu(ctx) {
   const text = "🛠 Панель администратора\n\nВыбери действие:";
   const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback("📚 Темы", "admin_topics")],
-    [Markup.button.callback("📘 Элементы аттестации", "admin_attest_items")],
     [Markup.button.callback("👥 Пользователи", "admin_users")],
     [Markup.button.callback("📢 Рассылка", "admin_broadcast_menu")],
+    [Markup.button.callback("⚙️ Настройки", "admin_settings")],
     [Markup.button.callback("⬅️ Назад", "back_main")],
   ]);
 
@@ -276,6 +275,35 @@ function registerAdminCommands(bot, ensureUser, logError) {
       await ctx.reply("Отправь PDF-файл для этой темы.\n\nФормат: *pdf*.");
     } catch (err) {
       logError("admin_topic_pdf_x", err);
+    }
+  });
+
+  bot.action("admin_settings", async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const user = await ensureUser(ctx);
+      if (!isAdmin(user)) return;
+
+      const text = "🛠 Настройки\n\nВыбери действие:";
+
+      const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback("👥 Пользователи", "admin_users")],
+        [Markup.button.callback("📢 Рассылка", "admin_broadcast_menu")],
+        [Markup.button.callback("🔽 Свернуть", "admin_menu")],
+        [Markup.button.callback("📚 Темы", "admin_topics")],
+        [Markup.button.callback("📘 Элементы аттестации", "admin_attest_menu")],
+        [
+          Markup.button.callback(
+            "🎓 Настроить стажировку",
+            "admin_internship_menu"
+          ),
+        ],
+        [Markup.button.callback("⬅️ Назад", "back_main")],
+      ]);
+
+      await deliver(ctx, { text, extra: keyboard }, { edit: true });
+    } catch (err) {
+      logError("admin_settings", err);
     }
   });
 

@@ -6,6 +6,7 @@ const { deliver } = require("../utils/renderHelpers");
 
 const SUPER_ADMIN_TELEGRAM_ID = "925270231"; // твой tg id
 const ADMIN_THEORY_PASS_PERCENT = 90; // порог зачёта по теме для теории (в %)
+const AI_LOGS_PAGE_SIZE = 10;
 
 function isAdmin(user) {
   return user && user.role === "admin";
@@ -71,8 +72,15 @@ async function showAdminUsers(ctx, options = {}) {
   );
   const filterItems = filtersRes.rows;
 
+  // виртуальный фильтр "стажёры"
+  filterItems.push({ id: -1, title: "стажёры" });
+
+  const newAiLogsCount = await getNewAiLogsCount();
+
   let activeFilter = null;
-  if (filterItemId) {
+  if (filterItemId === -1) {
+    activeFilter = { id: -1, title: "стажёры" };
+  } else if (filterItemId) {
     const fRes = await pool.query(
       "SELECT id, title FROM attestation_items WHERE id = $1",
       [filterItemId]
@@ -80,7 +88,7 @@ async function showAdminUsers(ctx, options = {}) {
     if (fRes.rows.length) {
       activeFilter = fRes.rows[0];
     } else {
-      filterItemId = 0; // элемент удалён — фильтр сбрасываем
+      filterItemId = 0;
     }
   }
 
@@ -90,19 +98,38 @@ async function showAdminUsers(ctx, options = {}) {
   const offset = (page - 1) * PAGE_SIZE;
 
   if (!filterItemId) {
-    // без фильтра
+    // БЕЗ ФИЛЬТРА
     const countRes = await pool.query("SELECT COUNT(*) FROM users");
     totalUsers = Number(countRes.rows[0].count) || 0;
 
     usersRes = await pool.query(
-      `SELECT id, telegram_id, role, full_name
-       FROM users
-       ORDER BY id ASC
-       LIMIT $1 OFFSET $2`,
+      `
+      SELECT id, telegram_id, role, full_name, staff_status, intern_days_completed
+      FROM users
+      ORDER BY id ASC
+      LIMIT $1 OFFSET $2
+      `,
+      [PAGE_SIZE, offset]
+    );
+  } else if (filterItemId === -1) {
+    // ФИЛЬТР "СТАЖЁРЫ"
+    const countRes = await pool.query(
+      "SELECT COUNT(*) FROM users WHERE staff_status = 'intern'"
+    );
+    totalUsers = Number(countRes.rows[0].count) || 0;
+
+    usersRes = await pool.query(
+      `
+      SELECT id, telegram_id, role, full_name, staff_status, intern_days_completed
+      FROM users
+      WHERE staff_status = 'intern'
+      ORDER BY id ASC
+      LIMIT $1 OFFSET $2
+      `,
       [PAGE_SIZE, offset]
     );
   } else {
-    // фильтр по элементу аттестации: показываем тех, у кого он НЕ passed
+    // ФИЛЬТР ПО ЭЛЕМЕНТУ АТТЕСТАЦИИ: те, кто НЕ сдали этот элемент
     const countRes = await pool.query(
       `
       SELECT COUNT(*)
@@ -117,7 +144,7 @@ async function showAdminUsers(ctx, options = {}) {
 
     usersRes = await pool.query(
       `
-      SELECT u.id, u.telegram_id, u.role, u.full_name
+      SELECT u.id, u.telegram_id, u.role, u.full_name, u.staff_status, u.intern_days_completed
       FROM users u
       LEFT JOIN user_attestation_status uas
         ON uas.user_id = u.id AND uas.item_id = $1
@@ -136,7 +163,11 @@ async function showAdminUsers(ctx, options = {}) {
   let text = "👥 Пользователи";
 
   if (activeFilter) {
-    text += ` (фильтр: ❌ ${activeFilter.title} — не сдали)`;
+    if (activeFilter.id === -1) {
+      text += " (фильтр: 🎓 стажёры)";
+    } else {
+      text += ` (фильтр: ❌ ${activeFilter.title} — не сдали)`;
+    }
   }
 
   if (!totalUsers) {
@@ -157,7 +188,9 @@ async function showAdminUsers(ctx, options = {}) {
   // сами пользователи
   for (const row of users) {
     const name = row.full_name || "Без имени";
-    const label = name;
+    const status = row.staff_status === "intern" ? "intern" : "employee";
+    const icon = status === "intern" ? "🎓" : "🧠";
+    const label = `${icon} ${name}`;
     buttons.push([Markup.button.callback(label, `admin_user_${row.id}`)]);
   }
 
@@ -193,21 +226,28 @@ async function showAdminUsers(ctx, options = {}) {
     }
   }
 
-  // панель фильтров
+  // панель фильтров + "Общение с ИИ"
+  const aiLabel =
+    newAiLogsCount > 0
+      ? `🤖 Общение с ИИ (${newAiLogsCount})`
+      : "🤖 Общение с ИИ";
+
   if (filterItems.length) {
     const panelFlagNext = showFilters ? 0 : 1;
     const filt = filterItemId || 0;
 
-    buttons.push([
-      Markup.button.callback(
-        "🔼 Фильтр",
-        `admin_users_list_${page}_${filt}_${panelFlagNext}`
-      ),
-    ]);
+    const filterBtn = Markup.button.callback(
+      "🔼 Фильтр",
+      `admin_users_list_${page}_${filt}_${panelFlagNext}`
+    );
+    const aiBtn = Markup.button.callback(aiLabel, "admin_ai_logs_1");
+
+    buttons.push([filterBtn, aiBtn]);
 
     if (showFilters) {
       for (const item of filterItems) {
-        const icon = "❌";
+        let icon = "❌";
+        if (item.id === -1) icon = "🎓";
         buttons.push([
           Markup.button.callback(
             `${icon} ${item.title}`,
@@ -220,6 +260,8 @@ async function showAdminUsers(ctx, options = {}) {
         Markup.button.callback("Показать всех", "admin_users_list_1_0_1"),
       ]);
     }
+  } else {
+    buttons.push([Markup.button.callback(aiLabel, "admin_ai_logs_1")]);
   }
 
   buttons.push([Markup.button.callback("🔙 В админ-панель", "admin_menu")]);
@@ -229,6 +271,185 @@ async function showAdminUsers(ctx, options = {}) {
     { text, extra: Markup.inlineKeyboard(buttons) },
     { edit: true }
   );
+}
+
+// -----------------------------------------------------------------------------
+// ИСТОРИЯ ОБЩЕНИЯ С ИИ
+// -----------------------------------------------------------------------------
+
+async function getNewAiLogsCount() {
+  const res = await pool.query(
+    "SELECT COUNT(*) AS cnt FROM ai_chat_logs WHERE is_new_for_admin = TRUE"
+  );
+  return Number(res.rows[0]?.cnt || 0);
+}
+
+async function getAiLogsPage(page) {
+  if (page < 1) page = 1;
+
+  const countRes = await pool.query("SELECT COUNT(*) AS cnt FROM ai_chat_logs");
+  const total = Number(countRes.rows[0]?.cnt || 0);
+  const totalPages = total > 0 ? Math.ceil(total / AI_LOGS_PAGE_SIZE) : 1;
+  if (page > totalPages) page = totalPages;
+
+  const offset = (page - 1) * AI_LOGS_PAGE_SIZE;
+
+  const res = await pool.query(
+    `
+    SELECT
+      l.id,
+      l.question,
+      l.answer,
+      l.created_at,
+      l.is_new_for_admin,
+      u.full_name
+    FROM ai_chat_logs l
+    LEFT JOIN users u ON u.id = l.user_id
+    ORDER BY l.created_at DESC
+    LIMIT $1 OFFSET $2
+    `,
+    [AI_LOGS_PAGE_SIZE, offset]
+  );
+
+  return {
+    total,
+    page,
+    totalPages,
+    logs: res.rows,
+  };
+}
+
+async function showAiLogsList(ctx, page) {
+  const { total, page: realPage, totalPages, logs } = await getAiLogsPage(page);
+
+  if (!total) {
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback("👥 К пользователям", "admin_users")],
+      [Markup.button.callback("🔙 В админ-панель", "admin_menu")],
+    ]);
+
+    await deliver(
+      ctx,
+      {
+        text: "🤖 История обращений к ИИ пока пуста.",
+        extra: keyboard,
+      },
+      { edit: true }
+    );
+    return;
+  }
+
+  let text =
+    "🤖 История обращений к ИИ\n\n" +
+    `Всего записей: ${total}\n` +
+    `Страница ${realPage} из ${totalPages}\n\n` +
+    "Выбери запрос:";
+
+  const buttons = [];
+
+  for (const row of logs) {
+    const date = row.created_at.toLocaleString("ru-RU", {
+      day: "2-digit",
+      month: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+
+    const name = row.full_name || "Без имени";
+    const newIcon = row.is_new_for_admin ? "🆕 " : "";
+    const label = `${newIcon}${date} — ${name}`;
+
+    // передаём также страницу, чтобы можно было вернуться
+    buttons.push([
+      Markup.button.callback(label, `admin_ai_log_${row.id}_${realPage}`),
+    ]);
+  }
+
+  // пагинация
+  const navRow = [];
+  if (realPage > 1) {
+    navRow.push(
+      Markup.button.callback("⬅️ Назад", `admin_ai_logs_${realPage - 1}`)
+    );
+  }
+  if (realPage < totalPages) {
+    navRow.push(
+      Markup.button.callback("➡️ Далее", `admin_ai_logs_${realPage + 1}`)
+    );
+  }
+  if (navRow.length) {
+    buttons.push(navRow);
+  }
+
+  buttons.push([Markup.button.callback("👥 К пользователям", "admin_users")]);
+  buttons.push([Markup.button.callback("🔙 В админ-панель", "admin_menu")]);
+
+  await deliver(
+    ctx,
+    { text, extra: Markup.inlineKeyboard(buttons) },
+    { edit: true }
+  );
+}
+
+async function showAiLogDetails(ctx, logId, returnPage) {
+  const res = await pool.query(
+    `
+    SELECT
+      l.id,
+      l.question,
+      l.answer,
+      l.created_at,
+      l.is_new_for_admin,
+      u.full_name
+    FROM ai_chat_logs l
+    LEFT JOIN users u ON u.id = l.user_id
+    WHERE l.id = $1
+    `,
+    [logId]
+  );
+
+  if (!res.rows.length) {
+    await ctx.reply("Запись общения с ИИ не найдена.");
+    return;
+  }
+
+  const row = res.rows[0];
+
+  // помечаем как прочитанное админом
+  if (row.is_new_for_admin) {
+    await pool.query(
+      "UPDATE ai_chat_logs SET is_new_for_admin = FALSE WHERE id = $1",
+      [logId]
+    );
+  }
+
+  const date = row.created_at.toLocaleString("ru-RU", {
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const name = row.full_name || "Без имени";
+
+  let text =
+    "🤖 Запрос к ИИ\n\n" +
+    `Пользователь: ${name}\n` +
+    `Дата: ${date}\n\n` +
+    `❓ Вопрос:\n${row.question}\n\n` +
+    `💡 Ответ ИИ:\n${row.answer}`;
+
+  const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback(
+        "🔙 К списку запросов",
+        `admin_ai_logs_${returnPage || 1}`
+      ),
+    ],
+    [Markup.button.callback("👥 К пользователям", "admin_users")],
+    [Markup.button.callback("🔙 В админ-панель", "admin_menu")],
+  ]);
+
+  await deliver(ctx, { text, extra: keyboard }, { edit: true });
 }
 
 // -----------------------------------------------------------------------------
@@ -847,7 +1068,7 @@ async function handleAdminTheoryMark(ctx, isCorrect, logError) {
 
 async function showUserAttestation(ctx, userId) {
   const userRes = await pool.query(
-    "SELECT id, telegram_id, role, full_name FROM users WHERE id = $1",
+    "SELECT id, telegram_id, role, full_name, staff_status, intern_days_completed FROM users WHERE id = $1",
     [userId]
   );
 
@@ -1011,15 +1232,21 @@ async function toggleUserItemStatus(userId, itemId, adminId) {
 // КАРТОЧКА ПОЛЬЗОВАТЕЛЯ (c настройками, аттестацией и тестами)
 // -----------------------------------------------------------------------------
 
-async function showAdminUserCard(ctx, userId, settingsOpen = false) {
+async function showAdminUserCard(
+  ctx,
+  userId,
+  settingsOpen = false,
+  showActivity = false
+) {
   const userRes = await pool.query(
-    "SELECT id, telegram_id, role, full_name FROM users WHERE id = $1",
+    "SELECT id, telegram_id, role, full_name, staff_status, intern_days_completed FROM users WHERE id = $1",
     [userId]
   );
   if (!userRes.rows.length) {
     await ctx.reply("Пользователь не найден.");
     return;
   }
+
   const user = userRes.rows[0];
   const name = user.full_name || "Без имени";
 
@@ -1043,72 +1270,35 @@ async function showAdminUserCard(ctx, userId, settingsOpen = false) {
     [userId]
   );
 
+  // последние тесты / тренировки
   const testsRes = await pool.query(
     `
-        SELECT
-          ts.created_at,
-          ts.mode,
-          ts.question_count,
-          ts.correct_count,
-          t.title AS topic_title,
-          ua.full_name AS admin_full_name
-        FROM test_sessions ts
-        LEFT JOIN topics t ON t.id = ts.topic_id
-        LEFT JOIN users ua ON ua.id = COALESCE(ts.conducted_by, ts.admin_id)
-        WHERE ts.user_id = $1
-        ORDER BY ts.created_at DESC
-        LIMIT 5
-        `,
+    SELECT
+      ts.created_at,
+      ts.mode,
+      ts.question_count,
+      ts.correct_count,
+      t.title AS topic_title,
+      ua.full_name AS admin_full_name
+    FROM test_sessions ts
+    LEFT JOIN topics t ON t.id = ts.topic_id
+    LEFT JOIN users ua ON ua.id = COALESCE(ts.conducted_by, ts.admin_id)
+    WHERE ts.user_id = $1
+    ORDER BY ts.created_at DESC
+    LIMIT 5
+    `,
     [user.id]
   );
 
-  let testsText = "📊 Последние тесты / тренировки:\n";
+  const isIntern = user.staff_status === "intern";
+  const dayNumber = (user.intern_days_completed || 0) + 1;
 
-  if (!testsRes.rows.length) {
-    testsText += "Пока нет ни одного теста.\n";
-  } else {
-    for (const row of testsRes.rows) {
-      const date = new Date(row.created_at.getTime() + 7 * 60 * 60 * 1000);
-      const dateStr = date.toLocaleString("ru-RU", {
-        day: "2-digit",
-        month: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-      });
+  let text =
+    `👤 ${name}\n` +
+    `Роль: ${user.role}\n` +
+    (isIntern ? `Статус: стажёр (день ${dayNumber})\n` : `Статус: работник\n`);
 
-      let modeLabel;
-
-      if (row.mode === "topic") {
-        modeLabel = `по теме: "${row.topic_title || "Без названия"}"`;
-      } else if (row.mode === "admin_base") {
-        modeLabel = `админ-тест «Теория база» по теме: "${
-          row.topic_title || "Без названия"
-        }"`;
-      } else if (row.mode === "admin_full") {
-        modeLabel = `админ-тест «Полная теория» по теме: "${
-          row.topic_title || "Без названия"
-        }"`;
-      } else {
-        modeLabel = "по всем темам";
-      }
-
-      const total = row.question_count;
-      const correct = row.correct_count;
-      const percent = total > 0 ? Math.round((correct / total) * 100) : 0;
-
-      let testerSuffix = "";
-      if (row.admin_full_name) {
-        testerSuffix = ` (${row.admin_full_name})`;
-      }
-
-      testsText +=
-        `• ${dateStr} — ${modeLabel}${testerSuffix}\n` +
-        `  Результат: ${correct}/${total} (${percent}%)\n`;
-    }
-  }
-
-  let text = `👤 ${name}\n` + `Роль: ${user.role}\n`;
-
+  // краткая сводка по аттестации
   if (attestRes.rows.length) {
     text += `\n────────────\n`;
     for (const row of attestRes.rows) {
@@ -1119,7 +1309,6 @@ async function showAdminUserCard(ctx, userId, settingsOpen = false) {
 
       let line = `${icon} ${rawTitle}`;
 
-      // показываем имя админа только для обычных элементов (не теория база/полная)
       if (
         passed &&
         row.updated_by_admin_name &&
@@ -1134,50 +1323,52 @@ async function showAdminUserCard(ctx, userId, settingsOpen = false) {
     text += `────────────\n`;
   }
 
-  text += `\n📊 Последние тесты / тренировки:\n`;
+  // блок "Активность пользователя" показываем ТОЛЬКО если явно запросили
+  if (showActivity) {
+    text += `\n📊 Последние тесты / тренировки:\n`;
 
-  if (!testsRes.rows.length) {
-    text += "Пока нет ни одного теста.\n";
-  } else {
-    for (const row of testsRes.rows) {
-      // сдвигаем время назад на 7 часов
-      const date = new Date(row.created_at.getTime() + 7 * 60 * 60 * 1000);
-      const dateStr = date.toLocaleString("ru-RU", {
-        day: "2-digit",
-        month: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-      });
+    if (!testsRes.rows.length) {
+      text += "Пока нет ни одного теста.\n";
+    } else {
+      for (const row of testsRes.rows) {
+        const date = new Date(row.created_at.getTime() + 7 * 60 * 60 * 1000);
+        const dateStr = date.toLocaleString("ru-RU", {
+          day: "2-digit",
+          month: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+        });
 
-      let modeLabel;
-      if (row.mode === "topic") {
-        modeLabel = `по теме: "${row.topic_title || "Без названия"}"`;
-      } else if (row.mode === "all") {
-        modeLabel = "по всем темам";
-      } else if (row.mode === "admin_base") {
-        modeLabel = `админ-тест «Теория база» по теме: "${
-          row.topic_title || "Без названия"
-        }"`;
-      } else if (row.mode === "admin_full") {
-        modeLabel = `админ-тест «Полная теория» по теме: "${
-          row.topic_title || "Без названия"
-        }"`;
-      } else {
-        modeLabel = row.mode || "неизвестный режим";
+        let modeLabel;
+        if (row.mode === "topic") {
+          modeLabel = `по теме: "${row.topic_title || "Без названия"}"`;
+        } else if (row.mode === "all") {
+          modeLabel = "по всем темам";
+        } else if (row.mode === "admin_base") {
+          modeLabel = `админ-тест «Теория база» по теме: "${
+            row.topic_title || "Без названия"
+          }"`;
+        } else if (row.mode === "admin_full") {
+          modeLabel = `админ-тест «Полная теория» по теме: "${
+            row.topic_title || "Без названия"
+          }"`;
+        } else {
+          modeLabel = row.mode || "неизвестный режим";
+        }
+
+        const total = row.question_count;
+        const correct = row.correct_count;
+        const percent = total > 0 ? Math.round((correct * 100) / total) : 0;
+
+        let testerSuffix = "";
+        if (row.admin_full_name) {
+          testerSuffix = ` (${row.admin_full_name})`;
+        }
+
+        text +=
+          `• ${dateStr} — ${modeLabel}${testerSuffix}\n` +
+          `  Результат: ${correct}/${total} (${percent}%)\n`;
       }
-
-      const total = row.question_count;
-      const correct = row.correct_count;
-      const percent = total > 0 ? Math.round((correct * 100) / total) : 0;
-
-      let testerSuffix = "";
-      if (row.admin_full_name) {
-        testerSuffix = ` (${row.admin_full_name})`;
-      }
-
-      text +=
-        `• ${dateStr} — ${modeLabel}${testerSuffix}\n` +
-        `  Результат: ${correct}/${total} (${percent}%)\n`;
     }
   }
 
@@ -1185,6 +1376,7 @@ async function showAdminUserCard(ctx, userId, settingsOpen = false) {
 
   const buttons = [];
 
+  // настройки
   if (!settingsOpen) {
     buttons.push([
       Markup.button.callback(
@@ -1211,6 +1403,15 @@ async function showAdminUserCard(ctx, userId, settingsOpen = false) {
       ),
     ]);
 
+    // новая кнопка: стажёр/работник
+    const staffLabel =
+      user.staff_status === "intern"
+        ? "Сделать работником"
+        : "Сделать стажёром";
+    buttons.push([
+      Markup.button.callback(staffLabel, `admin_user_toggle_staff_${user.id}`),
+    ]);
+
     buttons.push([
       Markup.button.callback(
         "🗑 Удалить пользователя",
@@ -1219,9 +1420,27 @@ async function showAdminUserCard(ctx, userId, settingsOpen = false) {
     ]);
   }
 
+  // основные разделы
   buttons.push([
     Markup.button.callback("✅ Аттестация", `admin_user_attest_${user.id}`),
   ]);
+
+  buttons.push([
+    Markup.button.callback("🎓 Стажировка", `admin_user_internship_${user.id}`),
+  ]);
+
+  // пока стажировку мы ещё не подключили — эту кнопку можно добавить позже
+  // buttons.push([
+  //   Markup.button.callback("🌱 Стажировка", `admin_user_internship_${user.id}`),
+  // ]);
+
+  buttons.push([
+    Markup.button.callback(
+      "📊 Активность пользователя",
+      `admin_user_activity_${user.id}`
+    ),
+  ]);
+
   buttons.push([Markup.button.callback("🔙 К пользователям", "admin_users")]);
   buttons.push([Markup.button.callback("🔙 В админ-панель", "admin_menu")]);
 
@@ -1581,6 +1800,50 @@ function registerAdminUsers(bot, ensureUser, logError) {
     }
   });
 
+  bot.action(/^admin_user_toggle_staff_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const userId = parseInt(ctx.match[1], 10);
+
+      const userRes = await pool.query(
+        "SELECT id, staff_status FROM users WHERE id = $1",
+        [userId]
+      );
+      if (!userRes.rows.length) {
+        await ctx.reply("Пользователь не найден.");
+        return;
+      }
+
+      const user = userRes.rows[0];
+      const newStatus = user.staff_status === "intern" ? "employee" : "intern";
+
+      await pool.query("UPDATE users SET staff_status = $1 WHERE id = $2", [
+        newStatus,
+        userId,
+      ]);
+
+      await showAdminUserCard(ctx, userId, true, false);
+    } catch (err) {
+      logError("admin_user_toggle_staff_x", err);
+    }
+  });
+
+  bot.action(/^admin_user_activity_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const userId = parseInt(ctx.match[1], 10);
+      await showAdminUserCard(ctx, userId, false, true);
+    } catch (err) {
+      logError("admin_user_activity_x", err);
+    }
+  });
+
   // открыть аттестацию пользователя
   bot.action(/^admin_user_attest_(\d+)$/, async (ctx) => {
     try {
@@ -1718,6 +1981,36 @@ function registerAdminUsers(bot, ensureUser, logError) {
   bot.action("admin_theory_mark_wrong", async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     await handleAdminTheoryMark(ctx, false, logError);
+  });
+
+  // список логов общения с ИИ
+  bot.action(/^admin_ai_logs_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const page = parseInt(ctx.match[1], 10) || 1;
+      await showAiLogsList(ctx, page);
+    } catch (err) {
+      logError("admin_ai_logs_x", err);
+    }
+  });
+
+  // отдельный лог: вопрос + ответ
+  bot.action(/^admin_ai_log_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const logId = parseInt(ctx.match[1], 10);
+      const page = parseInt(ctx.match[2], 10) || 1;
+
+      await showAiLogDetails(ctx, logId, page);
+    } catch (err) {
+      logError("admin_ai_log_x", err);
+    }
   });
 
   // текстовые шаги (создание пользователя + изменение имени)
