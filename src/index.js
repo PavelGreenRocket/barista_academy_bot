@@ -32,6 +32,8 @@ if (!BOT_TOKEN) {
 
 const bot = new Telegraf(BOT_TOKEN);
 
+
+
 // ----- Вспомогательные вещи -----
 
 function logError(context, error) {
@@ -81,17 +83,7 @@ async function showMainMenu(ctx) {
   ]);
   keyboard.push([Markup.button.callback("✅ Аттестация", "user_attest")]);
 
-  if (isAdmin) {
-    const hasInternship = await hasActiveInternshipSessionForTrainer(user.id);
-    if (hasInternship) {
-      keyboard.push([
-        Markup.button.callback(
-          "🧑‍🏫 Процесс стажировки",
-          "internship_active_menu"
-        ),
-      ]);
-    }
-  }
+
 
   // 👉 добавляем кнопку процесса стажировки, если у админа есть активная сессия
   if (isAdmin) {

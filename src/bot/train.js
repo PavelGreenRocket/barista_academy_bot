@@ -82,7 +82,6 @@ async function showTrainMenu(ctx, userId, targetUserId = null) {
   await deliver(ctx, { text, extra: keyboard }, { edit: true });
 }
 
-
 async function getTopics() {
   const res = await pool.query(
     "SELECT id, title FROM topics ORDER BY order_index, id"
@@ -326,8 +325,6 @@ function registerTrain(bot, ensureUser, logError) {
 
       clearTrainSession(ctx.from.id);
 
-      
-
       const topics = await getTopics();
       if (!topics.length) {
         const keyboard = Markup.inlineKeyboard([
@@ -371,7 +368,7 @@ function registerTrain(bot, ensureUser, logError) {
       const conductedBy = ctx.session?.adminTestingUser ? admin.id : null;
       clearTrainSession(ctx.from.id);
 
-      const levelInfo = await getUserTrainLevelInfo(userId);
+      const levelInfo = await getUserTrainLevelInfo(targetUserId);
 
       const topicId = parseInt(ctx.match[1], 10);
       const blocks = await getBlocksByTopic(topicId);
@@ -441,7 +438,7 @@ function registerTrain(bot, ensureUser, logError) {
 
       clearTrainSession(ctx.from.id);
 
-      const levelInfo = await getUserTrainLevelInfo(userId);
+      const levelInfo = await getUserTrainLevelInfo(targetUserId);
 
       const blocks = await getAllBlocks();
       if (!blocks.length) {

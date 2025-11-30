@@ -6,6 +6,8 @@ const { deliver } = require("../utils/renderHelpers");
 const configStates = new Map(); // key: adminTelegramId → { mode, partId?, stepId?, title? }
 // состояние ожидания медиа по этапам
 const mediaStates = new Map(); // key: adminTelegramId → { sessionId, stepId, type, partId, userId }
+// состояние для завершения стажировки (замечания и комментарий)
+const finishSessionStates = new Map(); // key: adminTelegramId → { mode, sessionId, userId, issuesText? }
 
 function isAdmin(user) {
   return user && user.role === "admin";
@@ -121,6 +123,73 @@ async function getSessionStepMap(sessionId) {
   return map;
 }
 
+// мапа step_id → самое "свежее" состояние по ВСЕМ неотменённым сессиям пользователя
+async function getUserOverallStepMap(userId) {
+  const res = await pool.query(
+    `
+    SELECT DISTINCT ON (r.step_id)
+      r.step_id,
+      r.is_passed,
+      r.checked_at,
+      r.session_id,
+      u.full_name AS checked_by_name
+    FROM internship_step_results r
+    JOIN internship_sessions s ON s.id = r.session_id
+    LEFT JOIN users u ON u.id = r.checked_by
+    WHERE s.user_id = $1
+      AND (s.is_canceled IS NULL OR s.is_canceled = FALSE)
+    ORDER BY r.step_id, r.is_passed DESC, r.checked_at DESC
+  `,
+    [userId]
+  );
+
+  const map = new Map();
+  for (const row of res.rows) {
+    map.set(row.step_id, {
+      is_passed: row.is_passed,
+      checked_at: row.checked_at,
+      checked_by_name: row.checked_by_name,
+      session_id: row.session_id,
+    });
+  }
+  return map;
+}
+
+// прогресс по этапам стажировки по всем неотменённым дням пользователя
+async function getUserStepProgressAcrossSessions(userId) {
+  // Берём только неотменённые дни
+  const sessRes = await pool.query(
+    `
+    SELECT id
+    FROM internship_sessions
+    WHERE user_id = $1 AND (is_canceled IS NULL OR is_canceled = FALSE)
+  `,
+    [userId]
+  );
+  const sessionIds = sessRes.rows.map((r) => r.id);
+
+  const map = new Map();
+  if (!sessionIds.length) {
+    return map;
+  }
+
+  const res = await pool.query(
+    `
+    SELECT step_id, bool_or(is_passed) AS is_passed
+    FROM internship_step_results
+    WHERE session_id = ANY($1::int[])
+    GROUP BY step_id
+  `,
+    [sessionIds]
+  );
+
+  for (const row of res.rows) {
+    map.set(row.step_id, row.is_passed);
+  }
+
+  return map;
+}
+
 function formatDurationMs(ms) {
   if (!ms || ms <= 0) return "-";
   const totalSec = Math.floor(ms / 1000);
@@ -219,12 +288,6 @@ async function showUserInternshipMenu(ctx, admin, targetUserId) {
       ),
     ]);
     buttons.push([
-      Markup.button.callback(
-        "🌱 Данные о стажировке",
-        `admin_internship_data_${user.id}`
-      ),
-    ]);
-    buttons.push([
       Markup.button.callback("🔙 К пользователю", `admin_user_${user.id}`),
     ]);
   }
@@ -236,7 +299,155 @@ async function showUserInternshipMenu(ctx, admin, targetUserId) {
   );
 }
 
-async function startInternshipSession(ctx, admin, targetUserId) {
+// выбор торговой точки перед стартом дня
+async function askStartInternshipTradePoint(ctx, admin, targetUserId) {
+  const uRes = await pool.query(
+    "SELECT id, full_name, staff_status, intern_days_completed FROM users WHERE id = $1",
+    [targetUserId]
+  );
+  if (!uRes.rows.length) {
+    await ctx.reply("Пользователь не найден.");
+    return;
+  }
+  const user = uRes.rows[0];
+
+  if (user.staff_status !== "intern") {
+    await ctx.reply(
+      "Этот сотрудник уже работник. Новую стажировку для него запустить нельзя."
+    );
+    return;
+  }
+
+  const active = await getActiveSessionForUser(user.id);
+  if (active) {
+    await ctx.reply(
+      "У этого стажёра уже есть незавершённая стажировка. Сначала завершите или отмените её."
+    );
+    return;
+  }
+
+  const tpRes = await pool.query(
+    `
+    SELECT id, title
+    FROM trade_points
+    WHERE is_active = TRUE
+    ORDER BY id
+    `
+  );
+  const points = tpRes.rows;
+
+  if (!points.length) {
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback("🔧 Торговые точки", "admin_trade_points")],
+      [
+        Markup.button.callback(
+          "🔙 К стажировке пользователя",
+          `admin_user_internship_${user.id}`
+        ),
+      ],
+    ]);
+
+    await deliver(
+      ctx,
+      {
+        text:
+          "Пока не добавлено ни одной торговой точки.\n" +
+          "Сначала добавьте её в разделе «🔧 Торговые точки».",
+        extra: keyboard,
+      },
+      { edit: true }
+    );
+    return;
+  }
+
+  let text =
+    `Стажёр: ${user.full_name || "Без имени"}\n\n` +
+    "Выберите торговую точку для этого дня стажировки:";
+
+  const buttons = [];
+
+  for (const tp of points) {
+    buttons.push([
+      Markup.button.callback(
+        `🏬 ${tp.title}`,
+        `admin_internship_start_tp_${user.id}_${tp.id}`
+      ),
+    ]);
+  }
+
+  buttons.push([
+    Markup.button.callback(
+      "🔙 К стажировке пользователя",
+      `admin_user_internship_${user.id}`
+    ),
+  ]);
+
+  await deliver(
+    ctx,
+    { text, extra: Markup.inlineKeyboard(buttons) },
+    { edit: true }
+  );
+}
+
+// вопрос "пришёл вовремя?"
+async function askStartInternshipLate(ctx, admin, userId, tradePointId) {
+  const uRes = await pool.query(
+    "SELECT id, full_name FROM users WHERE id = $1",
+    [userId]
+  );
+  if (!uRes.rows.length) {
+    await ctx.reply("Пользователь не найден.");
+    return;
+  }
+  const user = uRes.rows[0];
+
+  const tpRes = await pool.query(
+    "SELECT id, title FROM trade_points WHERE id = $1",
+    [tradePointId]
+  );
+  if (!tpRes.rows.length) {
+    await ctx.reply("Торговая точка не найдена.");
+    return;
+  }
+  const tp = tpRes.rows[0];
+
+  const text =
+    `Стажёр: ${user.full_name || "Без имени"}\n` +
+    `Торговая точка: ${tp.title}\n\n` +
+    "Стажёр пришёл вовремя?";
+
+  const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback(
+        "✅ Да, вовремя",
+        `admin_internship_start_late_yes_${user.id}_${tp.id}`
+      ),
+    ],
+    [
+      Markup.button.callback(
+        "⚠️ Нет, с опозданием",
+        `admin_internship_start_late_no_${user.id}_${tp.id}`
+      ),
+    ],
+    [
+      Markup.button.callback(
+        "🔙 Выбрать другую точку",
+        `admin_internship_start_${user.id}`
+      ),
+    ],
+  ]);
+
+  await deliver(ctx, { text, extra: keyboard }, { edit: true });
+}
+
+// фактический старт дня стажировки
+async function startInternshipSession(
+  ctx,
+  admin,
+  targetUserId,
+  tradePointId,
+  wasLate
+) {
   const uRes = await pool.query(
     "SELECT id, full_name, staff_status, intern_days_completed FROM users WHERE id = $1",
     [targetUserId]
@@ -266,18 +477,28 @@ async function startInternshipSession(ctx, admin, targetUserId) {
 
   const ins = await pool.query(
     `
-    INSERT INTO internship_sessions (user_id, day_number, started_by)
-    VALUES ($1, $2, $3)
+    INSERT INTO internship_sessions (user_id, day_number, started_by, trade_point_id, was_late)
+    VALUES ($1, $2, $3, $4, $5)
     RETURNING id
-  `,
-    [user.id, nextDay, admin.id]
+    `,
+    [user.id, nextDay, admin.id, tradePointId, wasLate]
   );
   const sessionId = ins.rows[0].id;
+
+  const tpRes = await pool.query(
+    "SELECT title FROM trade_points WHERE id = $1",
+    [tradePointId]
+  );
+  const tpTitle = tpRes.rows.length ? tpRes.rows[0].title : "не указана";
+
+  let lateText = "";
+  if (wasLate === true) lateText = " (стажёр пришёл с опозданием)";
+  else if (wasLate === false) lateText = " (без опоздания)";
 
   await ctx.reply(
     `Стажировка начата. День ${nextDay}. Стажёр: ${
       user.full_name || "Без имени"
-    }.`
+    }.\n` + `Торговая точка: ${tpTitle}${lateText}.`
   );
 
   await showUserInternshipMenu(ctx, admin, user.id);
@@ -446,8 +667,14 @@ async function setMediaStepPassed(sessionId, stepId, adminId, fileId) {
   }
 }
 
-// завершить день стажировки
-async function finishInternshipSession(ctx, sessionId, userId) {
+// завершить день стажировки (с учётом замечаний и комментария)
+async function finishInternshipSession(
+  ctx,
+  sessionId,
+  userId,
+  issuesText,
+  commentText
+) {
   const sRes = await pool.query(
     "SELECT * FROM internship_sessions WHERE id = $1",
     [sessionId]
@@ -470,10 +697,12 @@ async function finishInternshipSession(ctx, sessionId, userId) {
     `
     UPDATE internship_sessions
     SET finished_at = NOW(),
-        is_canceled = FALSE
+        is_canceled = FALSE,
+        issues = $2,
+        comment = $3
     WHERE id = $1
   `,
-    [sessionId]
+    [sessionId, issuesText || null, commentText || null]
   );
 
   await pool.query(
@@ -525,15 +754,27 @@ async function cancelInternshipSession(ctx, sessionId) {
 
 // ---------- ИСТОРИЯ ПО ПОЛЬЗОВАТЕЛЮ ----------
 
+// ---------- ИСТОРИЯ ПО ПОЛЬЗОВАТЕЛЮ ----------
+
+// ---------- ИСТОРИЯ ПО ПОЛЬЗОВАТЕЛЮ ----------
+
+// ---------- ИСТОРИЯ ПО ПОЛЬЗОВАТЕЛЮ ----------
+
 async function showUserInternshipData(ctx, userId) {
   const uRes = await pool.query(
-    "SELECT id, full_name, role, staff_status, intern_days_completed FROM users WHERE id = $1",
+    `
+    SELECT id, full_name, role, staff_status, intern_days_completed
+    FROM users
+    WHERE id = $1
+  `,
     [userId]
   );
+
   if (!uRes.rows.length) {
     await ctx.reply("Пользователь не найден.");
     return;
   }
+
   const user = uRes.rows[0];
   const name = user.full_name || "Без имени";
 
@@ -551,91 +792,764 @@ async function showUserInternshipData(ctx, userId) {
     WHERE s.user_id = $1
     ORDER BY s.day_number, s.started_at
   `,
-    [user.id]
+    [userId]
   );
   const sessions = sRes.rows;
 
-  const completedCount = sessions.filter(
-    (s) => !s.is_canceled && s.finished_at
+  const finishedDays = sessions.filter(
+    (s) => s.finished_at && !s.is_canceled
   ).length;
+
+  const isIntern = user.staff_status === "intern";
+  const currentDay = isIntern ? (user.intern_days_completed || 0) + 1 : null;
+  const statusLine = isIntern ? `стажёр (день ${currentDay})` : "работник";
 
   let text =
     `🌱 Стажировка: ${name}\n` +
     `Роль: ${user.role}\n` +
-    (user.staff_status === "intern"
-      ? `Статус: стажёр (день ${(user.intern_days_completed || 0) + 1})\n`
-      : `Статус: работник\n`) +
-    `\nВсего завершённых стажировок (дней): ${completedCount}\n\n`;
+    `Статус: ${statusLine}\n\n` +
+    `Всего завершённых стажировок (дней): ${finishedDays}\n\n` +
+    `Выбери раздел:\n`;
 
-  if (!sessions.length) {
-    text += "Стажировок пока не было.";
+  const buttons = [];
+
+  buttons.push([
+    Markup.button.callback(
+      "📊 Успеваемость",
+      `admin_internship_perf_${user.id}`
+    ),
+  ]);
+
+  buttons.push([
+    Markup.button.callback(
+      "ℹ️ Детали стажировки",
+      `admin_internship_details_${user.id}`
+    ),
+  ]);
+
+  buttons.push([
+    Markup.button.callback("🔙 К пользователю", `admin_user_${user.id}`),
+  ]);
+
+  buttons.push([Markup.button.callback("🔙 В админ-панель", "admin_menu")]);
+
+  await deliver(
+    ctx,
+    { text, extra: Markup.inlineKeyboard(buttons) },
+    { edit: true }
+  );
+}
+
+// 📊 Общая успеваемость по частям (без разбивки по дням)
+async function showUserInternshipPerformance(ctx, userId) {
+  const uRes = await pool.query(
+    `
+    SELECT id, full_name, role, staff_status, intern_days_completed
+    FROM users
+    WHERE id = $1
+  `,
+    [userId]
+  );
+  if (!uRes.rows.length) {
+    await ctx.reply("Пользователь не найден.");
+    return;
+  }
+
+  const user = uRes.rows[0];
+  const name = user.full_name || "Без имени";
+
+  // все сессии (для подсчёта завершённых дней)
+  const sessRes = await pool.query(
+    `
+    SELECT *
+    FROM internship_sessions
+    WHERE user_id = $1
+  `,
+    [userId]
+  );
+  const sessions = sessRes.rows;
+  const finishedDays = sessions.filter(
+    (s) => s.finished_at && !s.is_canceled
+  ).length;
+
+  const isIntern = user.staff_status === "intern";
+  const currentDay = isIntern ? (user.intern_days_completed || 0) + 1 : null;
+  const statusLine = isIntern ? `стажёр (день ${currentDay})` : "работник";
+
+  const parts = await getPartsWithSteps();
+  const overallMap = await getUserOverallStepMap(userId);
+
+  let text =
+    `🌱 Стажировка: ${name}\n` +
+    `Роль: ${user.role}\n` +
+    `Статус: ${statusLine}\n\n` +
+    `📊 Успеваемость\n\n` +
+    `Всего завершённых стажировок (дней): ${finishedDays}\n\n` +
+    `Выбери часть, чтобы посмотреть этапы:\n`;
+
+  const buttons = [];
+
+  for (const part of parts) {
+    if (!part.steps.length) continue;
+
+    let total = part.steps.length;
+    let passed = 0;
+
+    for (const step of part.steps) {
+      const state = overallMap.get(step.id);
+      if (state?.is_passed) passed++;
+    }
+
+    const percent = total ? Math.round((passed * 100) / total) : 0;
+
+    let icon = "⚪️";
+    if (passed === 0) icon = "❌";
+    else if (passed === total) icon = "✅";
+    else icon = "🟡";
+
+    const label = `${icon} Часть: ${part.title} — ${passed}/${total} этапов (${percent}%)`;
+
+    buttons.push([
+      Markup.button.callback(
+        label,
+        `admin_internship_perf_part_${user.id}_${part.id}`
+      ),
+    ]);
+  }
+
+  if (!buttons.length) {
+    text += `\n(Пока нет ни одной части с этапами.)`;
+  }
+
+  buttons.push([
+    Markup.button.callback(
+      "ℹ️ Детали стажировки",
+      `admin_internship_details_${user.id}`
+    ),
+  ]);
+  buttons.push([
+    Markup.button.callback(
+      "🔙 К разделам стажировки",
+      `admin_internship_data_${user.id}`
+    ),
+  ]);
+  buttons.push([
+    Markup.button.callback("🔙 К пользователю", `admin_user_${user.id}`),
+  ]);
+  buttons.push([Markup.button.callback("🔙 В админ-панель", "admin_menu")]);
+
+  await deliver(
+    ctx,
+    { text, extra: Markup.inlineKeyboard(buttons) },
+    { edit: true }
+  );
+}
+
+// 📊 Успеваемость: просмотр конкретной части (этапы по всем дням)
+async function showUserInternshipPerformancePart(ctx, userId, partId) {
+  const uRes = await pool.query(
+    `
+    SELECT id, full_name, role, staff_status, intern_days_completed
+    FROM users
+    WHERE id = $1
+  `,
+    [userId]
+  );
+  if (!uRes.rows.length) {
+    await ctx.reply("Пользователь не найден.");
+    return;
+  }
+  const user = uRes.rows[0];
+
+  const isIntern = user.staff_status === "intern";
+  const currentDay = isIntern ? (user.intern_days_completed || 0) + 1 : null;
+  const statusLine = isIntern ? `стажёр (день ${currentDay})` : "работник";
+
+  const parts = await getPartsWithSteps();
+  const part = parts.find((p) => p.id === partId);
+  if (!part) {
+    await ctx.reply("Часть стажировки не найдена.");
+    return;
+  }
+
+  const overallMap = await getUserOverallStepMap(userId);
+
+  let text =
+    `🌱 Стажировка: ${user.full_name || "Без имени"}\n` +
+    `Роль: ${user.role}\n` +
+    `Статус: ${statusLine}\n\n` +
+    `📊 Успеваемость — часть: ${part.title}\n\n` +
+    `Этапы:\n`;
+
+  const buttons = [];
+
+  if (!part.steps.length) {
+    text += "(В этой части пока нет этапов.)";
   } else {
-    const parts = await getPartsWithSteps();
+    for (const step of part.steps) {
+      const state = overallMap.get(step.id);
+      const passed = state?.is_passed === true;
+      const icon = passed ? "✅" : "❌";
 
-    for (const s of sessions) {
-      const trainer = s.trainer_name || "Неизвестно";
-      const day = s.day_number;
-      const started = s.started_at.toLocaleString("ru-RU", {
+      let typeIcon = "🔘";
+      if (step.type === "video" || step.step_type === "video") typeIcon = "🎥";
+      else if (step.type === "photo" || step.step_type === "photo")
+        typeIcon = "📷";
+
+      let label = `${icon} ${typeIcon} ${step.title}`;
+
+      if (passed && state.checked_by_name && state.checked_at) {
+        const dt = new Date(state.checked_at).toLocaleString("ru-RU", {
+          day: "2-digit",
+          month: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+        label += ` (${state.checked_by_name}, ${dt})`;
+      }
+
+      // строим callback так, чтобы:
+      //  - для простых этапов можно было при желании менять галочку
+      //  - для медиа — открывать фото/видео и менять его
+      const sessionId = state?.session_id;
+
+      if (sessionId) {
+        if (step.type === "simple" || step.step_type === "simple") {
+          buttons.push([
+            Markup.button.callback(
+              label,
+              `admin_internship_step_toggle_${sessionId}_${step.id}_${part.id}_${user.id}`
+            ),
+          ]);
+        } else {
+          buttons.push([
+            Markup.button.callback(
+              label,
+              `admin_internship_step_media_${sessionId}_${step.id}_${part.id}_${user.id}`
+            ),
+          ]);
+        }
+      } else {
+        // если ещё ни разу не делали этот этап — просто текстовая кнопка без действий
+        buttons.push([Markup.button.callback(label, "noop")]);
+      }
+    }
+  }
+
+  if (part.doc_file_id) {
+    buttons.push([
+      Markup.button.callback(
+        "📄 Описание части",
+        `admin_internship_part_doc_${part.id}`
+      ),
+    ]);
+  }
+
+  buttons.push([
+    Markup.button.callback(
+      "🔙 К частям (успеваемость)",
+      `admin_internship_perf_${user.id}`
+    ),
+  ]);
+  buttons.push([
+    Markup.button.callback("🔙 К пользователю", `admin_user_${user.id}`),
+  ]);
+  buttons.push([Markup.button.callback("🔙 В админ-панель", "admin_menu")]);
+
+  await deliver(
+    ctx,
+    { text, extra: Markup.inlineKeyboard(buttons) },
+    { edit: true }
+  );
+}
+
+// просмотр конкретного дня в режиме "📊 Успеваемость":
+// показываем части, дальше — те же этапы и медиа, что в процессе
+async function showUserInternshipHistoryDay(ctx, admin, userId, sessionId) {
+  const uRes = await pool.query(
+    `
+    SELECT id, full_name, role, staff_status, intern_days_completed
+    FROM users
+    WHERE id = $1
+  `,
+    [userId]
+  );
+  if (!uRes.rows.length) {
+    await ctx.reply("Пользователь не найден.");
+    return;
+  }
+  const user = uRes.rows[0];
+
+  const sRes = await pool.query(
+    `
+    SELECT s.*,
+           t.full_name AS trainer_name
+    FROM internship_sessions s
+    LEFT JOIN users t ON t.id = s.started_by
+    WHERE s.id = $1 AND s.user_id = $2
+  `,
+    [sessionId, userId]
+  );
+  if (!sRes.rows.length) {
+    await ctx.reply("День стажировки не найден.");
+    return;
+  }
+  const session = sRes.rows[0];
+
+  const parts = await getPartsWithSteps();
+  const stepMap = await getSessionStepMap(sessionId);
+
+  let userStatus;
+  if (user.staff_status === "intern") {
+    const currentDay = (user.intern_days_completed || 0) + 1;
+    userStatus = `стажёр (день ${currentDay})`;
+  } else {
+    userStatus = "работник";
+  }
+
+  const sessionStatus = session.is_canceled
+    ? "отменена"
+    : session.finished_at
+    ? "завершена"
+    : "в процессе";
+
+  const startedStr = session.started_at
+    ? new Date(session.started_at).toLocaleString("ru-RU", {
         day: "2-digit",
         month: "2-digit",
         hour: "2-digit",
         minute: "2-digit",
-      });
-      let statusText;
-      let durationMs = null;
-      if (s.is_canceled) {
-        statusText = "отменена";
-      } else if (!s.finished_at) {
-        statusText = "в процессе";
-      } else {
-        statusText = "завершена";
-        durationMs = new Date(s.finished_at) - new Date(s.started_at);
-      }
+      })
+    : "—";
 
-      text += `День ${day} (стажировал: ${trainer}, статус: ${statusText}`;
-      if (durationMs !== null) {
-        text += `, длительность: ${formatDurationMs(durationMs)}`;
-      }
-      text += `, начало: ${started})\n`;
+  let text =
+    `🌱 Стажировка: ${user.full_name || "Без имени"}\n` +
+    `Роль: ${user.role}\n` +
+    `Статус: ${userStatus}\n\n` +
+    `📊 Успеваемость — день ${session.day_number}\n` +
+    `Стажировал: ${
+      session.trainer_name || "Без имени"
+    }, статус: ${sessionStatus}, начало: ${startedStr}\n\n` +
+    `Части стажировки:\n`;
 
-      const stepMap = await getSessionStepMap(s.id);
+  const buttons = [];
 
-      for (const part of parts) {
-        if (!part.steps.length) continue;
-        const allPassed = part.steps.every(
-          (st) => stepMap.get(st.id)?.is_passed === true
-        );
-        const pIcon = allPassed ? "✅" : "❌";
-        text += `  • ${pIcon} Часть: ${part.title}\n`;
+  for (const part of parts) {
+    const partSteps = part.steps || [];
+    const total = partSteps.length;
+    let done = 0;
 
-        for (const step of part.steps) {
-          const st = stepMap.get(step.id);
-          const passed = st?.is_passed === true;
-          const icon = passed ? "✅" : "❌";
-          text += `    - ${icon} ${step.title}`;
-          if (passed && st.checked_by_name && st.checked_at) {
-            const dt = st.checked_at.toLocaleString("ru-RU", {
-              day: "2-digit",
-              month: "2-digit",
-              hour: "2-digit",
-              minute: "2-digit",
-            });
-            text += ` (${st.checked_by_name}, ${dt})`;
-          }
-          text += `\n`;
-        }
-      }
+    for (const st of partSteps) {
+      const stInfo = stepMap.get(st.id);
+      if (stInfo?.is_passed) done++;
+    }
 
-      text += `\n`;
+    let icon = "⚪️";
+    if (total > 0 && done === total) icon = "✅";
+    else if (done > 0) icon = "🟡";
+
+    const label = `${icon} Часть: ${part.title}`;
+
+    buttons.push([
+      Markup.button.callback(
+        label,
+        `admin_internship_session_part_${session.id}_${part.id}_${user.id}`
+      ),
+    ]);
+  }
+
+  buttons.push([
+    Markup.button.callback(
+      "🔙 К дням (успеваемость)",
+      `admin_internship_perf_${user.id}`
+    ),
+  ]);
+  buttons.push([
+    Markup.button.callback("🔙 К пользователю", `admin_user_${user.id}`),
+  ]);
+  buttons.push([Markup.button.callback("🔙 В админ-панель", "admin_menu")]);
+
+  await deliver(
+    ctx,
+    { text, extra: Markup.inlineKeyboard(buttons) },
+    { edit: true }
+  );
+}
+
+// экран "ℹ️ Детали стажировки": общая сводка + кнопки по дням
+async function showUserInternshipDetails(ctx, userId) {
+  const uRes = await pool.query(
+    `
+    SELECT id, full_name, role, staff_status, intern_days_completed
+    FROM users
+    WHERE id = $1
+  `,
+    [userId]
+  );
+  if (!uRes.rows.length) {
+    await ctx.reply("Пользователь не найден.");
+    return;
+  }
+  const user = uRes.rows[0];
+  const name = user.full_name || "Без имени";
+
+  const sRes = await pool.query(
+    `
+    SELECT
+      s.id,
+      s.day_number,
+      s.started_at,
+      s.finished_at,
+      s.is_canceled,
+      s.trade_point_id,
+      tp.title AS trade_point_title,
+      u.full_name AS trainer_name
+    FROM internship_sessions s
+    LEFT JOIN users u ON u.id = s.started_by
+    LEFT JOIN trade_points tp ON tp.id = s.trade_point_id
+    WHERE s.user_id = $1
+    ORDER BY s.day_number, s.started_at
+  `,
+    [userId]
+  );
+
+  const sessions = sRes.rows;
+
+  // используем только неотменённые дни
+  const validSessions = sessions.filter((s) => !s.is_canceled);
+
+  const finishedDays = validSessions.filter((s) => s.finished_at).length;
+
+  const isIntern = user.staff_status === "intern";
+  const currentDay = isIntern ? (user.intern_days_completed || 0) + 1 : null;
+  const statusLine = isIntern ? `стажёр (день ${currentDay})` : "работник";
+
+  let text =
+    `🌱 Стажировка: ${name}\n` +
+    `Роль: ${user.role}\n` +
+    `Статус: ${statusLine}\n\n` +
+    `Всего завершённых стажировок (дней): ${finishedDays}\n` +
+    `────────────\n`;
+
+  if (validSessions.length) {
+    text += "Кто стажировал по дням:\n";
+    for (const s of validSessions) {
+      const trainer = s.trainer_name || "Без имени";
+      text += `• день ${s.day_number} — ${trainer}\n`;
+    }
+  } else {
+    text += "Кто стажировал по дням: данных пока нет.\n";
+  }
+
+  text += "\n────────────\n";
+
+  // опоздания пока не храним — заглушка
+  text += "Опоздания:\nданные пока не внесены (добавим позже).\n";
+
+  text += "\n────────────\n";
+
+  if (validSessions.length) {
+    text += "Выбери день стажировки, чтобы посмотреть детали дня:\n";
+  } else {
+    text += "Деталей по дням пока нет.\n";
+  }
+
+  const buttons = [];
+
+  for (const s of validSessions) {
+    const startStr = s.started_at
+      ? new Date(s.started_at).toLocaleString("ru-RU", {
+          day: "2-digit",
+          month: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+        })
+      : "—";
+
+    const trainerName = s.trainer_name || "без тренера";
+    const tpTitle = s.trade_point_title || "не указана";
+
+    const label = `День ${s.day_number} — "${tpTitle}", ${trainerName}, ${startStr}`;
+
+    buttons.push([
+      Markup.button.callback(
+        label,
+        `admin_internship_details_day_${s.id}_${user.id}`
+      ),
+    ]);
+  }
+
+  buttons.push([
+    Markup.button.callback(
+      "🔙 К разделам стажировки",
+      `admin_internship_data_${user.id}`
+    ),
+  ]);
+  buttons.push([
+    Markup.button.callback("🔙 К пользователю", `admin_user_${user.id}`),
+  ]);
+  buttons.push([Markup.button.callback("🔙 В админ-панель", "admin_menu")]);
+
+  await deliver(
+    ctx,
+    { text, extra: Markup.inlineKeyboard(buttons) },
+    { edit: true }
+  );
+}
+
+// карточка "ДЕТАЛИ ДЕНЬ N"
+async function showUserInternshipDetailsDay(ctx, admin, userId, sessionId) {
+  const uRes = await pool.query(
+    `
+    SELECT id, full_name, role, staff_status, intern_days_completed
+    FROM users
+    WHERE id = $1
+  `,
+    [userId]
+  );
+  if (!uRes.rows.length) {
+    await ctx.reply("Пользователь не найден.");
+    return;
+  }
+  const user = uRes.rows[0];
+
+  const sRes = await pool.query(
+    `
+    SELECT s.*,
+           t.full_name AS trainer_name,
+           tp.title AS trade_point_title
+    FROM internship_sessions s
+    LEFT JOIN users t ON t.id = s.started_by
+    LEFT JOIN trade_points tp ON tp.id = s.trade_point_id
+    WHERE s.id = $1 AND s.user_id = $2
+  `,
+    [sessionId, userId]
+  );
+
+  if (!sRes.rows.length) {
+    await ctx.reply("День стажировки не найден.");
+    return;
+  }
+  const session = sRes.rows[0];
+
+  // для краткой "успеваемости" — считаем выполненные этапы
+  const parts = await getPartsWithSteps();
+  const stepMap = await getSessionStepMap(sessionId);
+
+  let totalSteps = 0;
+  let passedSteps = 0;
+  for (const part of parts) {
+    for (const step of part.steps || []) {
+      totalSteps++;
+      const st = stepMap.get(step.id);
+      if (st?.is_passed) passedSteps++;
     }
   }
 
-  const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback("🔙 К пользователю", `admin_user_${user.id}`)],
-    [Markup.button.callback("🔙 В админ-панель", "admin_menu")],
-  ]);
+  let perfText = "нет данных";
+  if (totalSteps > 0) {
+    const percent = Math.round((passedSteps * 100) / totalSteps);
+    perfText = `${passedSteps}/${totalSteps} этапов (${percent}%)`;
+  }
 
-  await deliver(ctx, { text, extra: keyboard }, { edit: true });
+  const isIntern = user.staff_status === "intern";
+  const currentDay = isIntern ? (user.intern_days_completed || 0) + 1 : null;
+  const statusLine = isIntern ? `стажёр (день ${currentDay})` : "работник";
+
+  const start = session.started_at ? new Date(session.started_at) : null;
+  const end = session.finished_at ? new Date(session.finished_at) : null;
+
+  let timeRange = "нет данных";
+  let durationText = "-";
+  if (start && end) {
+    const startStr = start.toLocaleTimeString("ru-RU", {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    const endStr = end.toLocaleTimeString("ru-RU", {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+    timeRange = `с ${startStr} до ${endStr}`;
+    durationText = formatDurationMs(end.getTime() - start.getTime());
+  }
+
+  let lateText;
+  if (session.was_late === true) {
+    lateText = "было (стажёр пришёл с опозданием)";
+  } else if (session.was_late === false) {
+    lateText = "не было";
+  } else {
+    lateText = "данные не указаны";
+  }
+
+  const tradePointText = session.trade_point_title || "не указана";
+  const commentText = session.comment || "комментариев нет";
+  const issuesText = session.issues || "не было";
+
+  let text =
+    `🌱 Стажировка: ${user.full_name || "Без имени"}\n` +
+    `Роль: ${user.role}\n` +
+    `Статус: ${statusLine}\n\n` +
+    `☑️ ДЕТАЛИ ДЕНЬ ${session.day_number}:\n` +
+    `────────────\n` +
+    `🕒 Длительность: ${timeRange} (${durationText})\n\n` +
+    `⏳ Опоздание: ${lateText}\n` +
+    `🏬 Торговая точка: ${tradePointText}\n` +
+    `🧑‍💼 Кто стажировал: ${session.trainer_name || "Без имени"}\n` +
+    `📊 Успеваемость: ${perfText}\n` +
+    `────────────\n` +
+    `Комментарии по стажировке: ${commentText}\n` +
+    `⚠️ Замечания: ${issuesText}\n`;
+
+  const buttons = [];
+
+  buttons.push([
+    Markup.button.callback(
+      "🔙 К дням (детали)",
+      `admin_internship_details_${user.id}`
+    ),
+  ]);
+  buttons.push([
+    Markup.button.callback("🔙 К пользователю", `admin_user_${user.id}`),
+  ]);
+  buttons.push([Markup.button.callback("🔙 В админ-панель", "admin_menu")]);
+
+  await deliver(
+    ctx,
+    { text, extra: Markup.inlineKeyboard(buttons) },
+    { edit: true }
+  );
+}
+
+// показ конкретного дня стажировки в режиме "история",
+// но с той же кнопочной структурой, что и в процессе стажировки
+async function showUserInternshipHistoryDay(ctx, admin, userId, sessionId) {
+  // проверим, что пользователь существует
+  const uRes = await pool.query(
+    `
+    SELECT id, full_name, role, staff_status, intern_days_completed
+    FROM users
+    WHERE id = $1
+  `,
+    [userId]
+  );
+
+  if (!uRes.rows.length) {
+    await ctx.reply("Пользователь не найден.");
+    return;
+  }
+  const user = uRes.rows[0];
+
+  // сам день стажировки
+  const sRes = await pool.query(
+    `
+    SELECT s.*,
+           t.full_name AS trainer_name
+    FROM internship_sessions s
+    LEFT JOIN users t ON t.id = s.started_by
+    WHERE s.id = $1 AND s.user_id = $2
+  `,
+    [sessionId, userId]
+  );
+
+  if (!sRes.rows.length) {
+    await ctx.reply("День стажировки не найден.");
+    return;
+  }
+
+  const session = sRes.rows[0];
+
+  // части + этапы
+  const parts = await getPartsWithSteps();
+
+  // статусы этапов по этому дню (map: step_id -> { is_passed, ... })
+  const stepMap = await getSessionStepMap(sessionId);
+
+  let userStatus;
+  if (user.staff_status === "intern") {
+    const currentDay = (user.intern_days_completed || 0) + 1;
+    userStatus = `стажёр (день ${currentDay})`;
+  } else {
+    userStatus = "работник";
+  }
+
+  const sessionStatus = session.is_canceled
+    ? "отменена"
+    : session.finished_at
+    ? "завершена"
+    : "в процессе";
+
+  const startedStr = session.started_at
+    ? session.started_at.toLocaleString("ru-RU", {
+        day: "2-digit",
+        month: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+      })
+    : "—";
+
+  let durationStr = "";
+  if (session.finished_at) {
+    const diffMs = session.finished_at - session.started_at;
+    const mins = Math.max(1, Math.round(diffMs / 60000));
+    durationStr = `${mins} мин`;
+  }
+
+  let text =
+    `🌱 Стажировка: ${user.full_name || "Без имени"}\n` +
+    `Роль: ${user.role}\n` +
+    `Статус: ${userStatus}\n\n` +
+    `День ${session.day_number} (стажировал: ${
+      session.trainer_name || "Без имени"
+    }, статус: ${sessionStatus}` +
+    (durationStr ? `, длительность: ${durationStr}` : "") +
+    `, начало: ${startedStr})\n\n` +
+    `Части стажировки:\n`;
+
+  const buttons = [];
+
+  for (const part of parts) {
+    const partSteps = part.steps || [];
+    const total = partSteps.length;
+    let done = 0;
+
+    for (const st of partSteps) {
+      const stInfo = stepMap.get(st.id);
+      if (stInfo?.is_passed) done++;
+    }
+
+    let icon = "⚪️";
+    if (total > 0 && done === total) icon = "✅";
+    else if (done > 0) icon = "🟡";
+
+    const label = `${icon} Часть: ${part.title}`;
+
+    // тот же callback, что и в процессе стажировки
+    buttons.push([
+      Markup.button.callback(
+        label,
+        `admin_internship_session_part_${session.id}_${part.id}_${user.id}`
+      ),
+    ]);
+  }
+
+  buttons.push([
+    Markup.button.callback(
+      "🔙 К дням стажировки",
+      `admin_internship_data_${user.id}`
+    ),
+  ]);
+  buttons.push([
+    Markup.button.callback("🔙 К пользователю", `admin_user_${user.id}`),
+  ]);
+  buttons.push([Markup.button.callback("🔙 В админ-панель", "admin_menu")]);
+
+  await deliver(
+    ctx,
+    { text, extra: Markup.inlineKeyboard(buttons) },
+    { edit: true }
+  );
 }
 
 // ---------- НАСТРОЙКА СТАЖИРОВКИ В АДМИН‑ПАНЕЛИ ----------
@@ -683,7 +1597,7 @@ async function showInternshipPart(ctx, partId) {
 
   const sRes = await pool.query(
     `
-    SELECT id, title, step_type, order_index
+    SELECT id, title, step_type, order_index, planned_duration_min
     FROM internship_steps
     WHERE part_id = $1
     ORDER BY order_index, id
@@ -709,7 +1623,13 @@ async function showInternshipPart(ctx, partId) {
           : st.step_type === "photo"
           ? "📷"
           : "🔘";
-      text += `• [${st.order_index}] ${typeLabel} ${st.title}\n`;
+
+      const durLabel =
+        st.planned_duration_min != null
+          ? ` — ${st.planned_duration_min} мин`
+          : "";
+
+      text += `• [${st.order_index}] ${typeLabel} ${st.title}${durLabel}\n`;
     }
   }
 
@@ -792,19 +1712,148 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
     }
   });
 
-  // старт дня стажировки
+  // 📊 Успеваемость
+  bot.action(/^admin_internship_perf_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const userId = parseInt(ctx.match[1], 10);
+      await showUserInternshipPerformance(ctx, userId);
+    } catch (err) {
+      logError("admin_internship_perf_x", err);
+    }
+  });
+
+  // 📊 Успеваемость: открыть часть
+  bot.action(/^admin_internship_perf_part_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const userId = parseInt(ctx.match[1], 10);
+      const partId = parseInt(ctx.match[2], 10);
+
+      await showUserInternshipPerformancePart(ctx, userId, partId);
+    } catch (err) {
+      logError("admin_internship_perf_part_x", err);
+    }
+  });
+
+  // ℹ️ Детали стажировки
+  bot.action(/^admin_internship_details_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const userId = parseInt(ctx.match[1], 10);
+      await showUserInternshipDetails(ctx, userId);
+    } catch (err) {
+      logError("admin_internship_details_x", err);
+    }
+  });
+
+  // выбор дня в "📊 Успеваемость"
+  bot.action(/^admin_internship_history_day_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const sessionId = parseInt(ctx.match[1], 10);
+      const userId = parseInt(ctx.match[2], 10);
+      await showUserInternshipHistoryDay(ctx, admin, userId, sessionId);
+    } catch (err) {
+      logError("admin_internship_history_day_x", err);
+    }
+  });
+
+  // выбор дня в "ℹ️ Детали стажировки"
+  bot.action(/^admin_internship_details_day_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const sessionId = parseInt(ctx.match[1], 10);
+      const userId = parseInt(ctx.match[2], 10);
+      await showUserInternshipDetailsDay(ctx, admin, userId, sessionId);
+    } catch (err) {
+      logError("admin_internship_details_day_x", err);
+    }
+  });
+
+  // выбор конкретного дня стажировки из истории
+  bot.action(/^admin_internship_history_day_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const sessionId = parseInt(ctx.match[1], 10);
+      const userId = parseInt(ctx.match[2], 10);
+
+      await showUserInternshipHistoryDay(ctx, admin, userId, sessionId);
+    } catch (err) {
+      logError("admin_internship_history_day_x", err);
+    }
+  });
+
+  // старт дня стажировки: шаг 1 — выбор торговой точки
   bot.action(/^admin_internship_start_(\d+)$/, async (ctx) => {
     try {
       await ctx.answerCbQuery().catch(() => {});
       const admin = await ensureUser(ctx);
       if (!isAdmin(admin)) return;
       const userId = parseInt(ctx.match[1], 10);
-      await startInternshipSession(ctx, admin, userId);
+      await askStartInternshipTradePoint(ctx, admin, userId);
     } catch (err) {
       logError("admin_internship_start_x", err);
     }
   });
 
+  // старт: шаг 2 — выбрана торговая точка
+  bot.action(/^admin_internship_start_tp_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const userId = parseInt(ctx.match[1], 10);
+      const tradePointId = parseInt(ctx.match[2], 10);
+
+      await askStartInternshipLate(ctx, admin, userId, tradePointId);
+    } catch (err) {
+      logError("admin_internship_start_tp_x", err);
+    }
+  });
+
+  // старт: шаг 3 — ответ на вопрос об опоздании
+  bot.action(
+    /^admin_internship_start_late_(yes|no)_(\d+)_(\d+)$/,
+    async (ctx) => {
+      try {
+        await ctx.answerCbQuery().catch(() => {});
+        const admin = await ensureUser(ctx);
+        if (!isAdmin(admin)) return;
+
+        const answer = ctx.match[1]; // "yes" или "no"
+        const userId = parseInt(ctx.match[2], 10);
+        const tradePointId = parseInt(ctx.match[3], 10);
+
+        // вопрос: "Стажёр пришёл вовремя?"
+        // yes => опоздания НЕ было; no => опоздание было
+        const wasLate = answer === "no";
+
+        await startInternshipSession(ctx, admin, userId, tradePointId, wasLate);
+      } catch (err) {
+        logError("admin_internship_start_late_x", err);
+      }
+    }
+  );
   // часть с этапами
   bot.action(
     /^admin_internship_session_part_(\d+)_(\d+)_(\d+)$/,
@@ -845,9 +1894,240 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
     }
   );
 
-  // запрос медиа для этапа
+  // запрос / просмотр медиа для этапа
   bot.action(
     /^admin_internship_step_media_(\d+)_(\d+)_(\d+)_(\d+)$/,
+    async (ctx) => {
+      try {
+        await ctx.answerCbQuery().catch(() => {});
+        const admin = await ensureUser(ctx);
+        if (!isAdmin(admin)) return;
+
+        const sessionId = parseInt(ctx.match[1], 10);
+        const stepId = parseInt(ctx.match[2], 10);
+        const partId = parseInt(ctx.match[3], 10);
+        const userId = parseInt(ctx.match[4], 10);
+
+        const stepRes = await pool.query(
+          "SELECT step_type, title FROM internship_steps WHERE id = $1",
+          [stepId]
+        );
+        if (!stepRes.rows.length) {
+          await ctx.reply("Этап не найден.");
+          return;
+        }
+        const step = stepRes.rows[0];
+
+        // проверяем, есть ли уже сохранённое медиа
+        const rRes = await pool.query(
+          `
+          SELECT media_file_id
+          FROM internship_step_results
+          WHERE session_id = $1 AND step_id = $2
+        `,
+          [sessionId, stepId]
+        );
+        const existingFileId = rRes.rows[0]?.media_file_id || null;
+
+        if (existingFileId) {
+          // показываем текущее медиа и предлагаем заменить
+          if (step.step_type === "video") {
+            await ctx.replyWithVideo(existingFileId, {
+              caption: `Сейчас для этапа "${step.title}" сохранено это видео.`,
+            });
+          } else if (step.step_type === "photo") {
+            await ctx.replyWithPhoto(existingFileId, {
+              caption: `Сейчас для этапа "${step.title}" сохранено это фото.`,
+            });
+          }
+
+          const keyboard = Markup.inlineKeyboard([
+            [
+              Markup.button.callback(
+                "🔁 Заменить файл",
+                `admin_internship_step_media_replace_${sessionId}_${stepId}_${partId}_${userId}`
+              ),
+            ],
+            [
+              Markup.button.callback(
+                "🔙 Назад к этапам",
+                `admin_internship_session_part_${sessionId}_${partId}_${userId}`
+              ),
+            ],
+          ]);
+
+          await ctx.reply("Ты можешь оставить это медиа или заменить его.", {
+            reply_markup: keyboard.reply_markup,
+          });
+          return;
+        }
+
+        // если медиа ещё нет — сразу просим отправить
+        const typeText =
+          step.step_type === "video"
+            ? "видео"
+            : step.step_type === "photo"
+            ? "фото"
+            : "медиа";
+
+        await ctx.reply(
+          `Отправь ${typeText} для этапа:\n"${step.title}"\n\nКак только файл будет получен, этап автоматически отметится как ✅.`
+        );
+
+        mediaStates.set(ctx.from.id, {
+          sessionId,
+          stepId,
+          type: step.step_type,
+          partId,
+          userId,
+        });
+      } catch (err) {
+        logError("admin_internship_step_media_x", err);
+      }
+    }
+  );
+
+  // завершить день: шаг 1 — спрашиваем про замечания
+  bot.action(/^admin_internship_finish_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const sessionId = parseInt(ctx.match[1], 10);
+      const userId = parseInt(ctx.match[2], 10);
+
+      finishSessionStates.delete(ctx.from.id);
+
+      const keyboard = Markup.inlineKeyboard([
+        [
+          Markup.button.callback(
+            "Да, были",
+            `admin_internship_finish_issues_yes_${sessionId}_${userId}`
+          ),
+        ],
+        [
+          Markup.button.callback(
+            "Нет",
+            `admin_internship_finish_issues_no_${sessionId}_${userId}`
+          ),
+        ],
+        [
+          Markup.button.callback(
+            "🔙 Отмена",
+            `admin_user_internship_${userId}`
+          ),
+        ],
+      ]);
+
+      await deliver(
+        ctx,
+        {
+          text: "Были ли замечания по стажёру в этот день стажировки?",
+          extra: keyboard,
+        },
+        { edit: true }
+      );
+    } catch (err) {
+      logError("admin_internship_finish_x", err);
+    }
+  });
+
+  // шаг 2а — ответ "Да, были": ждём текст замечаний
+  bot.action(
+    /^admin_internship_finish_issues_yes_(\d+)_(\d+)$/,
+    async (ctx) => {
+      try {
+        await ctx.answerCbQuery().catch(() => {});
+        const admin = await ensureUser(ctx);
+        if (!isAdmin(admin)) return;
+
+        const sessionId = parseInt(ctx.match[1], 10);
+        const userId = parseInt(ctx.match[2], 10);
+
+        finishSessionStates.set(ctx.from.id, {
+          mode: "await_issues_text",
+          sessionId,
+          userId,
+          issuesText: null,
+        });
+
+        await ctx.reply(
+          "Напиши замечания по стажёру одним сообщением (что именно было не так)."
+        );
+      } catch (err) {
+        logError("admin_internship_finish_issues_yes_x", err);
+      }
+    }
+  );
+
+  // шаг 2б — ответ "Нет": сразу переходим к комментарию
+  bot.action(/^admin_internship_finish_issues_no_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const sessionId = parseInt(ctx.match[1], 10);
+      const userId = parseInt(ctx.match[2], 10);
+
+      finishSessionStates.set(ctx.from.id, {
+        mode: "await_comment_text",
+        sessionId,
+        userId,
+        issuesText: null,
+      });
+
+      const keyboard = Markup.inlineKeyboard([
+        [
+          Markup.button.callback(
+            "Комментариев нет",
+            `admin_internship_finish_comment_none_${sessionId}_${userId}`
+          ),
+        ],
+      ]);
+
+      await deliver(
+        ctx,
+        {
+          text: "Оставьте общий комментарий по стажировке (как прошёл день) или нажмите «Комментариев нет».",
+          extra: keyboard,
+        },
+        { edit: false }
+      );
+    } catch (err) {
+      logError("admin_internship_finish_issues_no_x", err);
+    }
+  });
+
+  // шаг 3 — выбрано "Комментариев нет"
+  bot.action(
+    /^admin_internship_finish_comment_none_(\d+)_(\d+)$/,
+    async (ctx) => {
+      try {
+        await ctx.answerCbQuery().catch(() => {});
+        const admin = await ensureUser(ctx);
+        if (!isAdmin(admin)) return;
+
+        const sessionId = parseInt(ctx.match[1], 10);
+        const userId = parseInt(ctx.match[2], 10);
+
+        const state = finishSessionStates.get(ctx.from.id);
+        const issuesText = state?.issuesText || null;
+
+        finishSessionStates.delete(ctx.from.id);
+
+        await finishInternshipSession(ctx, sessionId, userId, issuesText, null);
+        await showUserInternshipMenu(ctx, admin, userId);
+      } catch (err) {
+        logError("admin_internship_finish_comment_none_x", err);
+      }
+    }
+  );
+
+  // режим "заменить файл" для медиа-этапа
+  bot.action(
+    /^admin_internship_step_media_replace_(\d+)_(\d+)_(\d+)_(\d+)$/,
     async (ctx) => {
       try {
         await ctx.answerCbQuery().catch(() => {});
@@ -875,8 +2155,9 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
             : step.step_type === "photo"
             ? "фото"
             : "медиа";
+
         await ctx.reply(
-          `Отправь ${typeText} для этапа:\n"${step.title}"\n\nКак только файл будет получен, этап автоматически отметится как ✅.`
+          `Отправь новое ${typeText} для этапа:\n"${step.title}"\n\nТекущий файл будет заменён, этап останется отмеченным как ✅.`
         );
 
         mediaStates.set(ctx.from.id, {
@@ -887,29 +2168,12 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
           userId,
         });
       } catch (err) {
-        logError("admin_internship_step_media_x", err);
+        logError("admin_internship_step_media_replace_x", err);
       }
     }
   );
 
-  // завершить день
-  bot.action(/^admin_internship_finish_(\d+)_(\d+)$/, async (ctx) => {
-    try {
-      await ctx.answerCbQuery().catch(() => {});
-      const admin = await ensureUser(ctx);
-      if (!isAdmin(admin)) return;
-
-      const sessionId = parseInt(ctx.match[1], 10);
-      const userId = parseInt(ctx.match[2], 10);
-
-      await finishInternshipSession(ctx, sessionId, userId);
-      await showUserInternshipMenu(ctx, admin, userId);
-    } catch (err) {
-      logError("admin_internship_finish_x", err);
-    }
-  });
-
-  // отменить день
+   // отменить день — сначала спрашиваем подтверждение
   bot.action(/^admin_internship_cancel_(\d+)_(\d+)$/, async (ctx) => {
     try {
       await ctx.answerCbQuery().catch(() => {});
@@ -919,12 +2183,109 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
       const sessionId = parseInt(ctx.match[1], 10);
       const userId = parseInt(ctx.match[2], 10);
 
-      await cancelInternshipSession(ctx, sessionId);
-      await showUserInternshipMenu(ctx, admin, userId);
+      const keyboard = Markup.inlineKeyboard([
+        [
+          Markup.button.callback(
+            "🗑 Да, отменить день",
+            `admin_internship_cancel_confirm_${sessionId}_${userId}`
+          ),
+        ],
+        [
+          Markup.button.callback(
+            "🔙 Не отменять",
+            `admin_user_internship_${userId}`
+          ),
+        ],
+      ]);
+
+      await deliver(
+        ctx,
+        {
+          text: "Точно отменить текущий день стажировки? День не будет засчитан.",
+          extra: keyboard,
+        },
+        { edit: true }
+      );
     } catch (err) {
       logError("admin_internship_cancel_x", err);
     }
   });
+
+  bot.action(
+    /^admin_internship_cancel_confirm_(\d+)_(\d+)$/,
+    async (ctx) => {
+      try {
+        await ctx.answerCbQuery().catch(() => {});
+        const admin = await ensureUser(ctx);
+        if (!isAdmin(admin)) return;
+
+        const sessionId = parseInt(ctx.match[1], 10);
+        const userId = parseInt(ctx.match[2], 10);
+
+        await cancelInternshipSession(ctx, sessionId);
+        await showUserInternshipMenu(ctx, admin, userId);
+      } catch (err) {
+        logError("admin_internship_cancel_confirm_x", err);
+      }
+    }
+  );
+  // отменить день — сначала спрашиваем подтверждение
+  bot.action(/^admin_internship_cancel_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const sessionId = parseInt(ctx.match[1], 10);
+      const userId = parseInt(ctx.match[2], 10);
+
+      const keyboard = Markup.inlineKeyboard([
+        [
+          Markup.button.callback(
+            "🗑 Да, отменить день",
+            `admin_internship_cancel_confirm_${sessionId}_${userId}`
+          ),
+        ],
+        [
+          Markup.button.callback(
+            "🔙 Не отменять",
+            `admin_user_internship_${userId}`
+          ),
+        ],
+      ]);
+
+      await deliver(
+        ctx,
+        {
+          text: "Точно отменить текущий день стажировки? День не будет засчитан.",
+          extra: keyboard,
+        },
+        { edit: true }
+      );
+    } catch (err) {
+      logError("admin_internship_cancel_x", err);
+    }
+  });
+
+  bot.action(
+    /^admin_internship_cancel_confirm_(\d+)_(\d+)$/,
+    async (ctx) => {
+      try {
+        await ctx.answerCbQuery().catch(() => {});
+        const admin = await ensureUser(ctx);
+        if (!isAdmin(admin)) return;
+
+        const sessionId = parseInt(ctx.match[1], 10);
+        const userId = parseInt(ctx.match[2], 10);
+
+        await cancelInternshipSession(ctx, sessionId);
+        await showUserInternshipMenu(ctx, admin, userId);
+      } catch (err) {
+        logError("admin_internship_cancel_confirm_x", err);
+      }
+    }
+  );
+
 
   // документ части (пользовательская часть)
   bot.action(/^admin_internship_part_doc_(\d+)$/, async (ctx) => {
@@ -1348,17 +2709,68 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
     }
   });
 
-  // текстовые шаги конфигурации
+  // текстовые шаги конфигурации + завершение стажировки
   bot.on("text", async (ctx, next) => {
     try {
       const user = await ensureUser(ctx);
       if (!isAdmin(user)) return next();
 
+      const raw = (ctx.message.text || "").trim();
+      if (!raw) return next();
+
+      // ---------- завершение стажировки (замечания / комментарий) ----------
+      const finishState = finishSessionStates.get(ctx.from.id);
+      if (finishState) {
+        // сначала ждём текст замечаний
+        if (finishState.mode === "await_issues_text") {
+          const issuesText = raw;
+
+          finishSessionStates.set(ctx.from.id, {
+            ...finishState,
+            issuesText,
+            mode: "await_comment_text",
+          });
+
+          const keyboard = Markup.inlineKeyboard([
+            [
+              Markup.button.callback(
+                "Комментариев нет",
+                `admin_internship_finish_comment_none_${finishState.sessionId}_${finishState.userId}`
+              ),
+            ],
+          ]);
+
+          await ctx.reply(
+            "Оставьте общий комментарий по стажировке (как прошёл день) или нажмите «Комментариев нет».",
+            keyboard
+          );
+          return;
+        }
+
+        // затем ждём общий комментарий
+        if (finishState.mode === "await_comment_text") {
+          const { sessionId, userId, issuesText } = finishState;
+          const commentText = raw || null;
+
+          finishSessionStates.delete(ctx.from.id);
+
+          await finishInternshipSession(
+            ctx,
+            sessionId,
+            userId,
+            issuesText || null,
+            commentText
+          );
+          await showUserInternshipMenu(ctx, user, userId);
+          return;
+        }
+      }
+
+      // ---------- конфигурация стажировки (части / этапы) ----------
       const state = configStates.get(ctx.from.id);
       if (!state) return next();
 
-      const text = (ctx.message.text || "").trim();
-      if (!text) return next();
+      const text = raw;
 
       if (state.mode === "new_part") {
         const maxRes = await pool.query(
@@ -1379,11 +2791,35 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
         return;
       }
 
+      // 1) получили название этапа -> спрашиваем время в минутах
       if (state.mode === "new_step_title") {
+        configStates.set(ctx.from.id, {
+          mode: "new_step_duration",
+          partId: state.partId,
+          title: text,
+        });
+
+        await ctx.reply(
+          "⏳ Введите плановое время прохождения этого этапа на стажировке (в минутах)."
+        );
+        return;
+      }
+
+      // 2) получили длительность -> спрашиваем тип этапа
+      if (state.mode === "new_step_duration") {
+        const minutes = parseInt(text, 10);
+        if (!Number.isFinite(minutes) || minutes <= 0) {
+          await ctx.reply(
+            "Пожалуйста, введите время в минутах числом, например: 5"
+          );
+          return;
+        }
+
         configStates.set(ctx.from.id, {
           mode: "new_step_type",
           partId: state.partId,
-          title: text,
+          title: state.title,
+          durationMin: minutes,
         });
 
         const keyboard = Markup.inlineKeyboard([
@@ -1434,7 +2870,7 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
       if (!state || state.mode !== "new_step_type") return;
 
       const type = ctx.match[1];
-      const { partId, title } = state;
+      const { partId, title, durationMin } = state;
 
       const maxRes = await pool.query(
         "SELECT COALESCE(MAX(order_index), 0) AS max FROM internship_steps WHERE part_id = $1",
@@ -1444,10 +2880,10 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
 
       await pool.query(
         `
-          INSERT INTO internship_steps (part_id, title, step_type, order_index)
-          VALUES ($1, $2, $3, $4)
+          INSERT INTO internship_steps (part_id, title, step_type, order_index, planned_duration_min)
+          VALUES ($1, $2, $3, $4, $5)
         `,
-        [partId, title, type, nextIndex]
+        [partId, title, type, nextIndex, durationMin || null]
       );
 
       configStates.delete(ctx.from.id);

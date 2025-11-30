@@ -74,6 +74,44 @@ async function showTopics(ctx) {
   );
 }
 
+async function showTradePoints(ctx) {
+  const res = await pool.query(
+    `
+    SELECT id, title
+    FROM trade_points
+    WHERE is_active = TRUE
+    ORDER BY id
+    `
+  );
+
+  let text = "🏬 Торговые точки:\n\n";
+  const buttons = [];
+
+  if (!res.rows.length) {
+    text +=
+      "Пока нет ни одной торговой точки.\n\n" +
+      "Нажми «➕ Добавить торговую точку», чтобы создать первую.";
+  } else {
+    for (const row of res.rows) {
+      text += `• ${row.title}\n`;
+    }
+  }
+
+  buttons.push([
+    Markup.button.callback(
+      "➕ Добавить торговую точку",
+      "admin_trade_point_new"
+    ),
+  ]);
+  buttons.push([Markup.button.callback("🔙 К настройкам", "admin_settings")]);
+
+  await deliver(
+    ctx,
+    { text, extra: Markup.inlineKeyboard(buttons) },
+    { edit: true }
+  );
+}
+
 async function showTopicBlocks(ctx, topicId) {
   const topicRes = await pool.query(
     "SELECT id, title, description FROM topics WHERE id = $1",
@@ -284,21 +322,19 @@ function registerAdminCommands(bot, ensureUser, logError) {
       const user = await ensureUser(ctx);
       if (!isAdmin(user)) return;
 
-      const text = "🛠 Настройки\n\nВыбери действие:";
+      const text = "🛠 Настройки\n\nВыберите, что хотите настроить:";
 
       const keyboard = Markup.inlineKeyboard([
-        [Markup.button.callback("👥 Пользователи", "admin_users")],
-        [Markup.button.callback("📢 Рассылка", "admin_broadcast_menu")],
-        [Markup.button.callback("🔽 Свернуть", "admin_menu")],
-        [Markup.button.callback("📚 Темы", "admin_topics")],
-        [Markup.button.callback("📘 Элементы аттестации", "admin_attest_menu")],
+        [Markup.button.callback("🔧 Темы", "admin_topics")],
+        [Markup.button.callback("🔧 Элементы аттестации", "admin_attest_menu")],
         [
           Markup.button.callback(
-            "🎓 Настроить стажировку",
+            "🔧 Настроить стажировку",
             "admin_internship_menu"
           ),
         ],
-        [Markup.button.callback("⬅️ Назад", "back_main")],
+        [Markup.button.callback("🔧 Торговые точки", "admin_trade_points")],
+        [Markup.button.callback("⬅️ Назад", "admin_menu")],
       ]);
 
       await deliver(ctx, { text, extra: keyboard }, { edit: true });
@@ -316,6 +352,44 @@ function registerAdminCommands(bot, ensureUser, logError) {
       await showTopicsReorder(ctx);
     } catch (err) {
       logError("admin_topics_reorder", err);
+    }
+  });
+
+  bot.action("admin_trade_points", async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const user = await ensureUser(ctx);
+      if (!isAdmin(user)) return;
+
+      clearState(ctx.from.id);
+      await showTradePoints(ctx);
+    } catch (err) {
+      logError("admin_trade_points", err);
+    }
+  });
+
+  bot.action("admin_trade_point_new", async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const user = await ensureUser(ctx);
+      if (!isAdmin(user)) return;
+
+      setState(ctx.from.id, { step: "await_trade_point_title" });
+
+      const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback("🔙 К торговым точкам", "admin_trade_points")],
+      ]);
+
+      await deliver(
+        ctx,
+        {
+          text: "🏬 Введи название новой торговой точки одним сообщением:",
+          extra: keyboard,
+        },
+        { edit: true }
+      );
+    } catch (err) {
+      logError("admin_trade_point_new", err);
     }
   });
 
@@ -1011,21 +1085,36 @@ function registerAdminCommands(bot, ensureUser, logError) {
       const user = await ensureUser(ctx);
       if (!isAdmin(user)) return next();
 
-      const state = adminStates.get(ctx.from.id);
-      if (!state) return next();
+      const adminState = adminStates.get(ctx.from.id);
+      if (!adminState) return next();
 
       const text = (ctx.message.text || "").trim();
       if (!text) return next();
 
+      // новая торговая точка
+      if (adminState.step === "await_trade_point_title") {
+        await pool.query(
+          `
+          INSERT INTO trade_points (title, is_active)
+          VALUES ($1, TRUE)
+          `,
+          [text]
+        );
+
+        clearState(ctx.from.id);
+        await showTradePoints(ctx);
+        return;
+      }
+
       // новая тема
-      if (state.step === "await_topic_title") {
+      if (adminState.step === "await_topic_title") {
         const insertRes = await pool.query(
           `INSERT INTO topics (title, order_index)
-           VALUES (
-             $1,
-             COALESCE((SELECT MAX(order_index) + 1 FROM topics), 1)
-           )
-           RETURNING id`,
+         VALUES (
+           $1,
+           COALESCE((SELECT MAX(order_index) + 1 FROM topics), 1)
+         )
+         RETURNING id`,
           [text]
         );
         const topicId = insertRes.rows[0].id;
@@ -1035,8 +1124,8 @@ function registerAdminCommands(bot, ensureUser, logError) {
       }
 
       // текст темы
-      if (state.step === "await_topic_description") {
-        const topicId = state.topicId;
+      if (adminState.step === "await_topic_description") {
+        const topicId = adminState.topicId;
         await pool.query("UPDATE topics SET description = $1 WHERE id = $2", [
           text,
           topicId,
@@ -1047,16 +1136,16 @@ function registerAdminCommands(bot, ensureUser, logError) {
       }
 
       // новый блок
-      if (state.step === "await_block_title") {
-        const topicId = state.topicId;
+      if (adminState.step === "await_block_title") {
+        const topicId = adminState.topicId;
         const insertRes = await pool.query(
           `INSERT INTO blocks (topic_id, title, order_index)
-           VALUES (
-             $1,
-             $2,
-             COALESCE((SELECT MAX(order_index) + 1 FROM blocks WHERE topic_id = $1), 1)
-           )
-           RETURNING id`,
+         VALUES (
+           $1,
+           $2,
+           COALESCE((SELECT MAX(order_index) + 1 FROM blocks WHERE topic_id = $1), 1)
+         )
+         RETURNING id`,
           [topicId, text]
         );
         const blockId = insertRes.rows[0].id;
@@ -1066,8 +1155,8 @@ function registerAdminCommands(bot, ensureUser, logError) {
       }
 
       // текст блока
-      if (state.step === "await_block_description") {
-        const blockId = state.blockId;
+      if (adminState.step === "await_block_description") {
+        const blockId = adminState.blockId;
         await pool.query("UPDATE blocks SET description = $1 WHERE id = $2", [
           text,
           blockId,
