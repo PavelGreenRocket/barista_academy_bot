@@ -391,9 +391,10 @@ function registerNotifications(bot, ensureUser, logError, showMainMenu) {
       for (const row of usersRes.rows) {
         try {
           await ctx.telegram.sendMessage(
-            row.telegram_id,
-            "📣 НОВОЕ УВЕДОМЛЕНИЕ! Нажмите /start"
+            u.telegram_id,
+            "📣 НОВОЕ УВЕДОМЛЕНИЕ! Нажмите /notification"
           );
+
           sendCount++;
         } catch (e) {
           // игнорируем ошибки конкретного юзера

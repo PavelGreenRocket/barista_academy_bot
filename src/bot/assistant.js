@@ -28,6 +28,7 @@ const gigaClient = new GigaChat({
 
 // состояние: ждём вопрос от конкретного пользователя (по telegram_id)
 const questionState = new Set();
+const MAX_AI_LOGS = 500; // сколько последних обращений к ИИ храним в БД
 
 /**
  * Вызов GigaChat: короткий ответ на вопрос бариста

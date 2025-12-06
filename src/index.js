@@ -20,6 +20,7 @@ const {
   registerInternship,
   hasActiveInternshipSessionForTrainer,
 } = require("./bot/internship");
+const { registerInterviewModule } = require("./bot/interviews");
 
 const { deliver } = require("./utils/renderHelpers");
 
@@ -31,8 +32,6 @@ if (!BOT_TOKEN) {
 }
 
 const bot = new Telegraf(BOT_TOKEN);
-
-
 
 // ----- Вспомогательные вещи -----
 
@@ -76,6 +75,7 @@ async function showMainMenu(ctx) {
 
   keyboard.push([Markup.button.callback(notifLabel, "user_notification_open")]);
 
+  // основные разделы
   keyboard.push([Markup.button.callback("📚 Теория", "user_theory")]);
   keyboard.push([Markup.button.callback("🎯 Тренировки", "user_train")]);
   keyboard.push([
@@ -83,9 +83,7 @@ async function showMainMenu(ctx) {
   ]);
   keyboard.push([Markup.button.callback("✅ Аттестация", "user_attest")]);
 
-
-
-  // 👉 добавляем кнопку процесса стажировки, если у админа есть активная сессия
+  // 👉 кнопка процесса стажировки, если у админа есть активная сессия
   if (isAdmin) {
     const hasInternship = await hasActiveInternshipSessionForTrainer(user.id);
     if (hasInternship) {
@@ -98,6 +96,30 @@ async function showMainMenu(ctx) {
     }
   }
 
+  // 👉 НОВОЕ: кнопка "Запланировано собеседование", если у админа есть активные кандидаты
+  if (isAdmin) {
+    const candRes = await pool.query(
+      `
+      SELECT 1
+      FROM candidates
+      WHERE status IN ('invited','interviewed','internship_invited')
+        AND admin_id = $1
+      LIMIT 1
+      `,
+      [user.id]
+    );
+
+    if (candRes.rows.length > 0) {
+      keyboard.push([
+        Markup.button.callback(
+          "❗ 🧑‍💻 Запланировано собеседование",
+          "admin_interviews"
+        ),
+      ]);
+    }
+  }
+
+  // переход в админ-панель
   if (isAdmin) {
     keyboard.push([Markup.button.callback("🛠 Админ-панель", "admin_menu")]);
   }
@@ -120,6 +142,7 @@ registerInstructions(bot, ensureUser, logError);
 registerNotifications(bot, ensureUser, logError, showMainMenu);
 registerAssistant(bot, ensureUser, logError);
 registerInternship(bot, ensureUser, logError, showMainMenu);
+registerInterviewModule(bot, ensureUser, logError, showMainMenu);
 
 // ----- Команды и кнопки для всех пользователей -----
 
