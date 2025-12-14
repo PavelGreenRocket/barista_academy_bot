@@ -23,6 +23,7 @@ const {
 const { registerInterviewModule } = require("./bot/interviews");
 
 const { deliver } = require("./utils/renderHelpers");
+const { startOutboxWorker } = require("./outbox/worker");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 
@@ -143,6 +144,8 @@ registerNotifications(bot, ensureUser, logError, showMainMenu);
 registerAssistant(bot, ensureUser, logError);
 registerInternship(bot, ensureUser, logError, showMainMenu);
 registerInterviewModule(bot, ensureUser, logError, showMainMenu);
+
+startOutboxWorker(bot);
 
 // ----- Команды и кнопки для всех пользователей -----
 
