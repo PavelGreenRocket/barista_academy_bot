@@ -13,6 +13,13 @@ function isAdmin(user) {
   return user && user.role === "admin";
 }
 
+function isTelegraphUrl(url) {
+  if (!url) return false;
+  const s = String(url).trim();
+  // допускаем telegraph / telegra.ph
+  return /^https?:\/\/(telegra\.ph|telegraph\.ph)\/[^\s]+$/i.test(s);
+}
+
 // ---------- HELPERS БАЗЫ ----------
 
 // активная сессия стажировки по тренеру (для кнопки в главном меню)
@@ -257,6 +264,14 @@ async function showUserInternshipMenu(ctx, admin, targetUserId) {
     text +=
       `Сейчас идёт стажировка (день ${activeSession.day_number}).\n` +
       "Ниже — части этого дня:\n\n";
+
+    // 🔹 Добавляем кнопку "К частям (продолжить обучение)"
+    buttons.push([
+      Markup.button.callback(
+        "📚 К частям (продолжить обучение)",
+        `admin_user_internship_${user.id}` // или другой твой callback
+      ),
+    ]);
 
     const parts = await getPartsWithSteps();
     const stepMap = await getSessionStepMap(activeSession.id);
@@ -540,9 +555,21 @@ async function showSessionPart(ctx, sessionId, partId, userId) {
   const stepMap = await getSessionStepMap(sessionId);
 
   let text =
-    `🎓 Стажировка — день ${session.day_number}\n` +
-    `Часть: ${part.title}\n\n` +
-    "Этапы:\n";
+    `🎓 Стажировка — день ${session.day_number}\n` + `Часть: ${part.title}\n\n`;
+
+  if (part.doc_file_id) {
+    text += `📚 Теория (Telegraph):\n${part.doc_file_id}\n\n`;
+  }
+
+  text += "Этапы:\n";
+
+  if (part.doc_file_id) {
+    // Тут теперь будет ссылка на Telegraph (храним её в doc_file_id)
+    // ВАЖНО: оставляем ссылку как текст, чтобы Telegram показал превью-карточку
+    text += `📚 Теория (Telegraph):\n${part.doc_file_id}\n\n`;
+  }
+
+  text += "Этапы:\n";
 
   const buttons = [];
 
@@ -576,15 +603,6 @@ async function showSessionPart(ctx, sessionId, partId, userId) {
         ]);
       }
     }
-  }
-
-  if (part.doc_file_id) {
-    buttons.push([
-      Markup.button.callback(
-        "📄 Описание части",
-        `admin_internship_part_doc_${part.id}`
-      ),
-    ]);
   }
 
   buttons.push([
@@ -751,12 +769,6 @@ async function cancelInternshipSession(ctx, sessionId) {
     `Стажировка (день ${session.day_number}) отменена. День не засчитан.`
   );
 }
-
-// ---------- ИСТОРИЯ ПО ПОЛЬЗОВАТЕЛЮ ----------
-
-// ---------- ИСТОРИЯ ПО ПОЛЬЗОВАТЕЛЮ ----------
-
-// ---------- ИСТОРИЯ ПО ПОЛЬЗОВАТЕЛЮ ----------
 
 // ---------- ИСТОРИЯ ПО ПОЛЬЗОВАТЕЛЮ ----------
 
@@ -1034,15 +1046,6 @@ async function showUserInternshipPerformancePart(ctx, userId, partId) {
         buttons.push([Markup.button.callback(label, "noop")]);
       }
     }
-  }
-
-  if (part.doc_file_id) {
-    buttons.push([
-      Markup.button.callback(
-        "📄 Описание части",
-        `admin_internship_part_doc_${part.id}`
-      ),
-    ]);
   }
 
   buttons.push([
@@ -1610,7 +1613,7 @@ async function showInternshipPart(ctx, partId) {
     `Часть стажировки:\n` +
     `Название: ${part.title}\n` +
     `Порядок: ${part.order_index}\n` +
-    `Документ: ${part.doc_file_id ? "✅ прикреплён" : "❌ нет"}\n\n` +
+    `Telegraph: ${part.doc_file_id ? "✅ прикреплён" : "❌ нет"}\n\n` +
     "Этапы:\n";
 
   if (!steps.length) {
@@ -1652,7 +1655,7 @@ async function showInternshipPart(ctx, partId) {
   ]);
   buttons.push([
     Markup.button.callback(
-      "📎 Документ (Word)",
+      "📝 Telegraph (теория)",
       `admin_internship_part_doc_edit_${part.id}`
     ),
   ]);
@@ -2173,62 +2176,6 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
     }
   );
 
-   // отменить день — сначала спрашиваем подтверждение
-  bot.action(/^admin_internship_cancel_(\d+)_(\d+)$/, async (ctx) => {
-    try {
-      await ctx.answerCbQuery().catch(() => {});
-      const admin = await ensureUser(ctx);
-      if (!isAdmin(admin)) return;
-
-      const sessionId = parseInt(ctx.match[1], 10);
-      const userId = parseInt(ctx.match[2], 10);
-
-      const keyboard = Markup.inlineKeyboard([
-        [
-          Markup.button.callback(
-            "🗑 Да, отменить день",
-            `admin_internship_cancel_confirm_${sessionId}_${userId}`
-          ),
-        ],
-        [
-          Markup.button.callback(
-            "🔙 Не отменять",
-            `admin_user_internship_${userId}`
-          ),
-        ],
-      ]);
-
-      await deliver(
-        ctx,
-        {
-          text: "Точно отменить текущий день стажировки? День не будет засчитан.",
-          extra: keyboard,
-        },
-        { edit: true }
-      );
-    } catch (err) {
-      logError("admin_internship_cancel_x", err);
-    }
-  });
-
-  bot.action(
-    /^admin_internship_cancel_confirm_(\d+)_(\d+)$/,
-    async (ctx) => {
-      try {
-        await ctx.answerCbQuery().catch(() => {});
-        const admin = await ensureUser(ctx);
-        if (!isAdmin(admin)) return;
-
-        const sessionId = parseInt(ctx.match[1], 10);
-        const userId = parseInt(ctx.match[2], 10);
-
-        await cancelInternshipSession(ctx, sessionId);
-        await showUserInternshipMenu(ctx, admin, userId);
-      } catch (err) {
-        logError("admin_internship_cancel_confirm_x", err);
-      }
-    }
-  );
   // отменить день — сначала спрашиваем подтверждение
   bot.action(/^admin_internship_cancel_(\d+)_(\d+)$/, async (ctx) => {
     try {
@@ -2267,25 +2214,74 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
     }
   });
 
-  bot.action(
-    /^admin_internship_cancel_confirm_(\d+)_(\d+)$/,
-    async (ctx) => {
-      try {
-        await ctx.answerCbQuery().catch(() => {});
-        const admin = await ensureUser(ctx);
-        if (!isAdmin(admin)) return;
+  bot.action(/^admin_internship_cancel_confirm_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
 
-        const sessionId = parseInt(ctx.match[1], 10);
-        const userId = parseInt(ctx.match[2], 10);
+      const sessionId = parseInt(ctx.match[1], 10);
+      const userId = parseInt(ctx.match[2], 10);
 
-        await cancelInternshipSession(ctx, sessionId);
-        await showUserInternshipMenu(ctx, admin, userId);
-      } catch (err) {
-        logError("admin_internship_cancel_confirm_x", err);
-      }
+      await cancelInternshipSession(ctx, sessionId);
+      await showUserInternshipMenu(ctx, admin, userId);
+    } catch (err) {
+      logError("admin_internship_cancel_confirm_x", err);
     }
-  );
+  });
+  // отменить день — сначала спрашиваем подтверждение
+  bot.action(/^admin_internship_cancel_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
 
+      const sessionId = parseInt(ctx.match[1], 10);
+      const userId = parseInt(ctx.match[2], 10);
+
+      const keyboard = Markup.inlineKeyboard([
+        [
+          Markup.button.callback(
+            "🗑 Да, отменить день",
+            `admin_internship_cancel_confirm_${sessionId}_${userId}`
+          ),
+        ],
+        [
+          Markup.button.callback(
+            "🔙 Не отменять",
+            `admin_user_internship_${userId}`
+          ),
+        ],
+      ]);
+
+      await deliver(
+        ctx,
+        {
+          text: "Точно отменить текущий день стажировки? День не будет засчитан.",
+          extra: keyboard,
+        },
+        { edit: true }
+      );
+    } catch (err) {
+      logError("admin_internship_cancel_x", err);
+    }
+  });
+
+  bot.action(/^admin_internship_cancel_confirm_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const sessionId = parseInt(ctx.match[1], 10);
+      const userId = parseInt(ctx.match[2], 10);
+
+      await cancelInternshipSession(ctx, sessionId);
+      await showUserInternshipMenu(ctx, admin, userId);
+    } catch (err) {
+      logError("admin_internship_cancel_confirm_x", err);
+    }
+  });
 
   // документ части (пользовательская часть)
   bot.action(/^admin_internship_part_doc_(\d+)$/, async (ctx) => {
@@ -2305,9 +2301,17 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
       }
 
       const part = res.rows[0];
-      await ctx.replyWithDocument(part.doc_file_id, {
-        caption: `Описание части: ${part.title}`,
-      });
+
+      // отправляем ссылку (Telegram покажет превью)
+      await ctx.reply(`📚 Теория (Telegraph):\n${part.doc_file_id}`);
+
+      // (опционально) кнопка открыть
+      await ctx.reply(
+        "Открыть:",
+        Markup.inlineKeyboard([
+          [Markup.button.url("⚡️ открыть Telegraph", part.doc_file_id)],
+        ])
+      );
     } catch (err) {
       logError("admin_internship_part_doc_x", err);
     }
@@ -2421,13 +2425,18 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
       if (!isAdmin(admin)) return;
 
       const partId = parseInt(ctx.match[1], 10);
-      configStates.set(ctx.from.id, {
-        mode: "part_doc",
-        partId,
-      });
 
-      await ctx.reply(
-        "Отправь Word‑документ (.doc / .docx) с описанием этой части стажировки."
+      configStates.set(ctx.from.id, { mode: "await_part_telegraph", partId });
+
+      await deliver(
+        ctx,
+        {
+          text:
+            "📝 Пришли ссылку Telegraph для этой части одним сообщением.\n\n" +
+            "Пример: https://telegra.ph/....\n" +
+            "Чтобы очистить — пришли: -",
+        },
+        { edit: true }
       );
     } catch (err) {
       logError("admin_internship_part_doc_edit_x", err);
@@ -2682,7 +2691,7 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
       if (!isAdmin(user)) return next();
 
       const state = configStates.get(ctx.from.id);
-      if (!state || state.mode !== "part_doc") return next();
+      if (!state || state.mode !== "await_part_doc") return next();
 
       const doc = ctx.message.document;
       if (!doc) return next();
@@ -2771,6 +2780,38 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
       if (!state) return next();
 
       const text = raw;
+
+      // === TELEGRAPH ДЛЯ ЧАСТИ ===
+      if (state.mode === "await_part_telegraph") {
+        // очистка
+        if (text === "-") {
+          await pool.query(
+            "UPDATE internship_parts SET doc_file_id = NULL WHERE id = $1",
+            [state.partId]
+          );
+          configStates.delete(ctx.from.id);
+          await ctx.reply("✅ Telegraph очищен.");
+          await showInternshipPart(ctx, state.partId);
+          return;
+        }
+
+        if (!isTelegraphUrl(text)) {
+          await ctx.reply(
+            "❌ Пришли ссылку Telegraph вида https://telegra.ph/..."
+          );
+          return;
+        }
+
+        await pool.query(
+          "UPDATE internship_parts SET doc_file_id = $1 WHERE id = $2",
+          [text, state.partId]
+        );
+
+        configStates.delete(ctx.from.id);
+        await ctx.reply("✅ Ссылка Telegraph сохранена.");
+        await showInternshipPart(ctx, state.partId);
+        return;
+      }
 
       if (state.mode === "new_part") {
         const maxRes = await pool.query(

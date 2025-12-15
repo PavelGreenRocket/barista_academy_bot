@@ -11,10 +11,6 @@ const registerTrain = require("./bot/train");
 const registerAttest = require("./bot/attest");
 const registerAdminUsers = require("./bot/adminUsers");
 const registerInstructions = require("./bot/instructions");
-const {
-  registerNotifications,
-  hasUnreadNotification,
-} = require("./bot/notifications");
 const { registerAssistant } = require("./bot/assistant");
 const {
   registerInternship,
@@ -69,12 +65,6 @@ async function showMainMenu(ctx) {
   const text = "Привет! Я бот для обучения бариста. ☕\n\nВыбери раздел:";
 
   const keyboard = [];
-
-  // уведомление...
-  const hasNotif = await hasUnreadNotification(user.id);
-  const notifLabel = hasNotif ? "🔔‿🔔 НОВОЕ УВЕДОМЛЕНИЕ❗" : "🔔 уведомления";
-
-  keyboard.push([Markup.button.callback(notifLabel, "user_notification_open")]);
 
   // основные разделы
   keyboard.push([Markup.button.callback("📚 Теория", "user_theory")]);
@@ -140,7 +130,6 @@ registerTrain(bot, ensureUser, logError);
 registerAttest(bot, ensureUser, logError);
 registerAdminUsers(bot, ensureUser, logError);
 registerInstructions(bot, ensureUser, logError);
-registerNotifications(bot, ensureUser, logError, showMainMenu);
 registerAssistant(bot, ensureUser, logError);
 registerInternship(bot, ensureUser, logError, showMainMenu);
 registerInterviewModule(bot, ensureUser, logError, showMainMenu);

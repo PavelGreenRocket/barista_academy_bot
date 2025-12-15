@@ -3,7 +3,6 @@
 const pool = require("../db/pool");
 const { Markup } = require("telegraf");
 const { deliver } = require("../utils/renderHelpers");
-const { hasUnreadNotification } = require("./notifications");
 
 // key: telegram_id, value: { step, topicId?, blockId? }
 const adminStates = new Map();
