@@ -1747,13 +1747,8 @@ async function showSessionSection(
     `Часть: ${sec.part_title}\n` +
     `Раздел ${currentPos}/${totalSecs}\n\n`;
 
-  // показываем ТОЛЬКО красивую ссылку (без "Этапы:" и без дублей)
-  if (sec.telegraph_url) {
-    text += `${sec.telegraph_url}\n\n`;
-  }
-
   // короткая инструкция прямо под ссылкой (как ты просил)
-  text += `Ниже этапы — отметь выполнение всех этапов, прежде чем переходить к следующему разделу.\n`;
+  text += `Ниже (кнопки) этапы — нажми, чтобы отметить выполнение.\n`;
 
   const buttons = [];
 
@@ -1761,12 +1756,13 @@ async function showSessionSection(
   for (const st of steps) {
     const passed = stepMap.get(st.id)?.is_passed === true;
     const icon = passed ? "✅" : "❌";
-    buttons.push([
-      Markup.button.callback(
-        `${icon} ${st.title}`,
-        `admin_internship_step_${sessionId}_${st.id}_${userId}`
-      ),
-    ]);
+
+    const cb =
+      st.step_type === "simple"
+        ? `admin_internship_step_toggle_${sessionId}_${st.id}_${sec.part_id}_${userId}`
+        : `admin_internship_step_media_${sessionId}_${st.id}_${sec.part_id}_${userId}`;
+
+    buttons.push([Markup.button.callback(`${icon} ${st.title}`, cb)]);
   }
 
   // стрелки навигации
@@ -1798,7 +1794,15 @@ async function showSessionSection(
   ]);
 
   const keyboard = Markup.inlineKeyboard(buttons);
-  await deliver(ctx, { text, extra: keyboard }, { edit: true });
+
+  const extra = {
+    ...keyboard,
+    ...(sec.telegraph_url
+      ? { link_preview_options: { url: sec.telegraph_url } }
+      : {}),
+  };
+
+  await deliver(ctx, { text, extra }, { edit: true });
 }
 
 async function showInternshipPart(ctx, partId) {
