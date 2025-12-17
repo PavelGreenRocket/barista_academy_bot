@@ -196,6 +196,72 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
   bot.action("noop", async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
   });
+  // ✅ Главное меню → "🧑‍🏫 Процесс стажировки"
+  bot.action("internship_active_menu", async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const me = await ensureUser(ctx);
+      if (!me || !isAdmin(me)) return;
+
+      // все активные сессии, которые запустил этот тренер (админ)
+      const res = await pool.query(
+        `
+        SELECT s.id, s.user_id, s.day_number, s.started_at,
+               u.full_name
+        FROM internship_sessions s
+        LEFT JOIN users u ON u.id = s.user_id
+        WHERE s.started_by = $1
+          AND s.finished_at IS NULL
+          AND s.is_canceled = FALSE
+        ORDER BY s.started_at DESC
+        `,
+        [me.id]
+      );
+
+      if (!res.rows.length) {
+        // на всякий случай (если кнопка показалась, но сессий уже нет)
+        const kb = Markup.inlineKeyboard([
+          [Markup.button.callback("🔙 В главное меню", "back_main")],
+        ]);
+        await deliver(
+          ctx,
+          { text: "Активных стажировок сейчас нет.", extra: kb },
+          { edit: true }
+        );
+        return;
+      }
+
+      // если одна — сразу открываем меню стажировки этого стажёра
+      if (res.rows.length === 1) {
+        await showUserInternshipMenu(ctx, me, res.rows[0].user_id);
+        return;
+      }
+
+      // если несколько — покажем список, кого выбрать
+      const buttons = res.rows.map((row) => {
+        const name = row.full_name || `ID ${row.user_id}`;
+        return [
+          Markup.button.callback(
+            `👤 ${name} — день ${row.day_number}`,
+            `admin_user_internship_${row.user_id}`
+          ),
+        ];
+      });
+
+      buttons.push([Markup.button.callback("🔙 В главное меню", "back_main")]);
+
+      await deliver(
+        ctx,
+        {
+          text: "Выбери стажёра (активные сессии):",
+          extra: Markup.inlineKeyboard(buttons),
+        },
+        { edit: true }
+      );
+    } catch (err) {
+      logError("internship_active_menu", err);
+    }
+  });
 
   // ==========================
   // НАВИГАЦИЯ ПО СЕССИИ (prev/next раздел)
