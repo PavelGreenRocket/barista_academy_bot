@@ -15,7 +15,7 @@ const { registerAssistant } = require("./bot/assistant");
 const {
   registerInternship,
   hasActiveInternshipSessionForTrainer,
-} = require("./bot/internship");
+} = require("./bot/internship/index");
 const { registerInterviewModule } = require("./bot/interviews");
 
 const { deliver } = require("./utils/renderHelpers");
