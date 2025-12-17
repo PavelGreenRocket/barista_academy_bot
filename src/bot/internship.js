@@ -55,7 +55,7 @@ async function getActiveSessionForUser(userId) {
   return res.rows[0] || null;
 }
 
-// части + этапы
+// части + разделы + этапы (этапы строго внутри разделов)
 async function getPartsWithSteps() {
   const res = await pool.query(
     `
@@ -64,14 +64,27 @@ async function getPartsWithSteps() {
       p.title AS part_title,
       p.order_index AS part_order,
       p.doc_file_id,
-      s.id AS step_id,
-      s.title AS step_title,
-      s.step_type,
-      s.order_index AS step_order
+
+      sec.id AS section_id,
+      sec.title AS section_title,
+      sec.order_index AS section_order,
+      sec.telegraph_url AS section_telegraph_url,
+      sec.duration_days AS section_duration_days,
+
+      st.id AS step_id,
+      st.title AS step_title,
+      st.step_type,
+      st.order_index AS step_order,
+      st.planned_duration_min
     FROM internship_parts p
-    LEFT JOIN internship_steps s
-      ON s.part_id = p.id
-    ORDER BY p.order_index, p.id, s.order_index, s.id
+    LEFT JOIN internship_sections sec
+      ON sec.part_id = p.id
+    LEFT JOIN internship_steps st
+      ON st.section_id = sec.id
+    ORDER BY
+      p.order_index, p.id,
+      sec.order_index, sec.id,
+      st.order_index, st.id
   `
   );
 
@@ -85,19 +98,59 @@ async function getPartsWithSteps() {
         title: row.part_title,
         order_index: row.part_order,
         doc_file_id: row.doc_file_id,
+        // новый источник истины
+        sections: [],
+        // для обратной совместимости по коду ниже: плоский список этапов части
         steps: [],
       };
       partsMap.set(row.part_id, part);
     }
 
-    if (row.step_id) {
-      part.steps.push({
-        id: row.step_id,
-        title: row.step_title,
-        type: row.step_type,
-        order_index: row.step_order,
-      });
+    // section
+    if (row.section_id) {
+      let sec = part.sections.find((s) => s.id === row.section_id);
+      if (!sec) {
+        sec = {
+          id: row.section_id,
+          title: row.section_title,
+          order_index: row.section_order,
+          telegraph_url: row.section_telegraph_url,
+          duration_days: row.section_duration_days,
+          steps: [],
+        };
+        part.sections.push(sec);
+      }
+
+      // step
+      if (row.step_id) {
+        const stepObj = {
+          id: row.step_id,
+          title: row.step_title,
+          type: row.step_type,
+          step_type: row.step_type,
+          order_index: row.step_order,
+          planned_duration_min: row.planned_duration_min,
+          section_id: row.section_id,
+        };
+        sec.steps.push(stepObj);
+        part.steps.push(stepObj);
+      }
     }
+  }
+
+  // на всякий случай сортируем внутри JS (если в БД где-то NULL order_index)
+  for (const part of partsMap.values()) {
+    part.sections.sort(
+      (a, b) => (a.order_index ?? 0) - (b.order_index ?? 0) || a.id - b.id
+    );
+    for (const sec of part.sections) {
+      sec.steps.sort(
+        (a, b) => (a.order_index ?? 0) - (b.order_index ?? 0) || a.id - b.id
+      );
+    }
+    part.steps.sort(
+      (a, b) => (a.order_index ?? 0) - (b.order_index ?? 0) || a.id - b.id
+    );
   }
 
   return [...partsMap.values()];
@@ -229,9 +282,7 @@ async function showUserInternshipMenu(ctx, admin, targetUserId) {
   let text =
     `👤 ${name}\n` +
     `Роль: ${user.role}\n` +
-    (isIntern
-      ? `Статус: стажёр (день ${nextDay})\n\n`
-      : `Статус: работник\n\n`);
+    (isIntern ? `Статус: стажёр\n\n` : `Статус: работник\n\n`);
 
   const buttons = [];
 
@@ -262,16 +313,8 @@ async function showUserInternshipMenu(ctx, admin, targetUserId) {
     ]);
   } else {
     text +=
-      `Сейчас идёт стажировка (день ${activeSession.day_number}).\n` +
-      "Ниже — части этого дня:\n\n";
-
-    // 🔹 Добавляем кнопку "К частям (продолжить обучение)"
-    buttons.push([
-      Markup.button.callback(
-        "📚 К частям (продолжить обучение)",
-        `admin_user_internship_${user.id}` // или другой твой callback
-      ),
-    ]);
+      `Сейчас идёт стажировка.\n` +
+      "Нажмите на часть, чтобы начать/продолжить обучение.\n\n";
 
     const parts = await getPartsWithSteps();
     const stepMap = await getSessionStepMap(activeSession.id);
@@ -528,101 +571,11 @@ async function startInternshipSession(
   await showUserInternshipMenu(ctx, admin, user.id);
 }
 
-// показать часть с этапами
+// показать часть (для действующей сессии) — теперь всегда показываем РАЗДЕЛЫ, а не плоский список этапов
 async function showSessionPart(ctx, sessionId, partId, userId) {
-  const sRes = await pool.query(
-    "SELECT * FROM internship_sessions WHERE id = $1",
-    [sessionId]
-  );
-  if (!sRes.rows.length) {
-    await ctx.reply("Сессия стажировки не найдена.");
-    return;
-  }
-  const session = sRes.rows[0];
-
-  const pRes = await pool.query(
-    "SELECT id, title, doc_file_id FROM internship_parts WHERE id = $1",
-    [partId]
-  );
-  if (!pRes.rows.length) {
-    await ctx.reply("Часть стажировки не найдена.");
-    return;
-  }
-  const part = pRes.rows[0];
-
-  const stepsRes = await pool.query(
-    `
-    SELECT id, title, step_type, order_index
-    FROM internship_steps
-    WHERE part_id = $1
-    ORDER BY order_index, id
-  `,
-    [partId]
-  );
-  const steps = stepsRes.rows;
-
-  const stepMap = await getSessionStepMap(sessionId);
-
-  let text =
-    `🎓 Стажировка — день ${session.day_number}\n` + `Часть: ${part.title}\n\n`;
-
-  if (part.doc_file_id) {
-    text += `📚 Теория (Telegraph):\n${part.doc_file_id}\n\n`;
-  }
-
-  text += "Этапы:\n";
-
-  if (part.doc_file_id) {
-    // Тут теперь будет ссылка на Telegraph (храним её в doc_file_id)
-    // ВАЖНО: оставляем ссылку как текст, чтобы Telegram показал превью-карточку
-    text += `📚 Теория (Telegraph):\n${part.doc_file_id}\n\n`;
-  }
-
-  text += "Этапы:\n";
-
-  const buttons = [];
-
-  if (!steps.length) {
-    text += "(В этой части пока нет этапов.)";
-  } else {
-    for (const step of steps) {
-      const state = stepMap.get(step.id);
-      const passed = state?.is_passed === true;
-      const icon = passed ? "✅" : "❌";
-
-      let typeIcon = "🔘";
-      if (step.step_type === "video") typeIcon = "🎥";
-      else if (step.step_type === "photo") typeIcon = "📷";
-
-      const label = `${icon} ${typeIcon} ${step.title}`;
-
-      if (step.step_type === "simple") {
-        buttons.push([
-          Markup.button.callback(
-            label,
-            `admin_internship_step_toggle_${sessionId}_${step.id}_${partId}_${userId}`
-          ),
-        ]);
-      } else {
-        buttons.push([
-          Markup.button.callback(
-            label,
-            `admin_internship_step_media_${sessionId}_${step.id}_${partId}_${userId}`
-          ),
-        ]);
-      }
-    }
-  }
-
-  buttons.push([
-    Markup.button.callback("🔙 К частям", `admin_user_internship_${userId}`),
-  ]);
-
-  await deliver(
-    ctx,
-    { text, extra: Markup.inlineKeyboard(buttons) },
-    { edit: true }
-  );
+  return showSessionPartSections(ctx, sessionId, partId, userId, {
+    edit: true,
+  });
 }
 
 async function showSessionPartSections(
@@ -663,20 +616,23 @@ async function showSessionPartSections(
   );
 
   const sections = secRes.rows;
+  const sectionIds = sections.map((s) => s.id);
 
   // карта результатов по сессии
   const stepMap = await getSessionStepMap(sessionId);
 
-  // достанем все steps для этих sections одним запросом
-  const stRes = await pool.query(
-    `
-    SELECT id, section_id
-    FROM internship_steps
-    WHERE part_id = $1
-    ORDER BY order_index ASC
-    `,
-    [partId]
-  );
+  // достанем все steps для этих sections одним запросом (этапы строго внутри разделов)
+  const stRes = sectionIds.length
+    ? await pool.query(
+        `
+        SELECT id, section_id
+        FROM internship_steps
+        WHERE section_id = ANY($1::int[])
+        ORDER BY order_index ASC, id ASC
+        `,
+        [sectionIds]
+      )
+    : { rows: [] };
 
   const stepsBySection = new Map();
   for (const r of stRes.rows) {
@@ -1759,8 +1715,8 @@ async function showSessionSection(
 
     const cb =
       st.step_type === "simple"
-        ? `admin_internship_step_toggle_${sessionId}_${st.id}_${sec.part_id}_${userId}`
-        : `admin_internship_step_media_${sessionId}_${st.id}_${sec.part_id}_${userId}`;
+        ? `admin_internship_step_toggle_${sessionId}_${sectionId}_${st.id}_${userId}`
+        : `admin_internship_step_media_${sessionId}_${sectionId}_${st.id}_${userId}`;
 
     buttons.push([Markup.button.callback(`${icon} ${st.title}`, cb)]);
   }
@@ -1818,7 +1774,7 @@ async function showInternshipPart(ctx, partId) {
 
   const secRes = await pool.query(
     `
-    SELECT id, title, order_index, telegraph_url
+    SELECT id, title, order_index, telegraph_url, duration_days
     FROM internship_sections
     WHERE part_id = $1
     ORDER BY order_index ASC, id ASC
@@ -1827,54 +1783,26 @@ async function showInternshipPart(ctx, partId) {
   );
   const sections = secRes.rows;
 
-  const sRes = await pool.query(
-    `
-    SELECT id, title, step_type, order_index, planned_duration_min
-    FROM internship_steps
-    WHERE part_id = $1
-    ORDER BY order_index, id
-  `,
-    [partId]
-  );
-  const steps = sRes.rows;
-
   let text =
-    `Часть стажировки:\n` +
-    `Название: ${part.title}\n` +
-    `Порядок: ${part.order_index}\n` +
-    `Разделы: (см. ниже)\n\n` +
-    "Этапы:\n";
+    `Часть стажировки:
+` +
+    `Название: ${part.title}
+` +
+    `Порядок: ${part.order_index}
 
-  text += "Разделы:\n";
+` +
+    `Разделы (нажмите, чтобы редактировать):
+`;
+
   if (!sections.length) {
-    text += "(пока нет разделов)\n";
+    text += "(пока нет разделов)";
   } else {
     for (const sec of sections) {
-      text += `• [${sec.order_index}] ${sec.title} ${
-        sec.telegraph_url ? "✅" : "❌"
-      }\n`;
-    }
-  }
-
-  text += "\nЭтапы:\n";
-
-  if (!steps.length) {
-    text += "(пока нет этапов)\n";
-  } else {
-    for (const st of steps) {
-      let typeLabel =
-        st.step_type === "video"
-          ? "🎥"
-          : st.step_type === "photo"
-          ? "📷"
-          : "🔘";
-
-      const durLabel =
-        st.planned_duration_min != null
-          ? ` — ${st.planned_duration_min} мин`
-          : "";
-
-      text += `• [${st.order_index}] ${typeLabel} ${st.title}${durLabel}\n`;
+      const tg = sec.telegraph_url ? "✅" : "❌";
+      const dur =
+        sec.duration_days != null ? `, срок: ${sec.duration_days} дн.` : "";
+      text += `• [${sec.order_index}] ${sec.title} ${tg}${dur}
+`;
     }
   }
 
@@ -1896,38 +1824,21 @@ async function showInternshipPart(ctx, partId) {
     ),
   ]);
 
-  for (const st of steps) {
-    buttons.push([
-      Markup.button.callback(
-        st.title,
-        `admin_internship_step_${st.id}_${part.id}`
-      ),
-    ]);
-  }
-
   buttons.push([
     Markup.button.callback(
-      "➕ Добавить этап",
-      `admin_internship_step_new_${part.id}`
+      "🔁 Изменить последовательность",
+      `admin_internship_part_sections_reorder_${part.id}`
     ),
   ]);
 
-  buttons.push([
-    Markup.button.callback(
-      "⬆️ Часть вверх",
-      `admin_internship_part_up_${part.id}`
-    ),
-    Markup.button.callback(
-      "⬇️ Часть вниз",
-      `admin_internship_part_down_${part.id}`
-    ),
-  ]);
+  // Управление частью (без перемещения вверх/вниз).
   buttons.push([
     Markup.button.callback(
       "🗑 Удалить часть",
       `admin_internship_part_del_${part.id}`
     ),
   ]);
+
   buttons.push([
     Markup.button.callback("🔙 К частям", "admin_internship_menu"),
   ]);
@@ -1943,7 +1854,7 @@ async function showInternshipPart(ctx, partId) {
 
 async function showInternshipSection(ctx, sectionId, partId) {
   const sRes = await pool.query(
-    `SELECT id, title, order_index, telegraph_url FROM internship_sections WHERE id=$1`,
+    `SELECT id, title, order_index, telegraph_url, duration_days FROM internship_sections WHERE id=$1`,
     [sectionId]
   );
   if (!sRes.rows.length) {
@@ -1956,7 +1867,8 @@ async function showInternshipSection(ctx, sectionId, partId) {
     `Раздел стажировки:\n` +
     `Название: ${sec.title}\n` +
     `Порядок: ${sec.order_index}\n` +
-    `Telegraph: ${sec.telegraph_url ? "✅ прикреплён" : "❌ нет"}\n`;
+    `Telegraph: ${sec.telegraph_url ? "✅ прикреплён" : "❌ нет"}\n` +
+    `Срок: ${sec.duration_days ? `${sec.duration_days} дн.` : "не указан"}\n`;
 
   const keyboard = Markup.inlineKeyboard([
     [
@@ -1973,14 +1885,20 @@ async function showInternshipSection(ctx, sectionId, partId) {
     ],
     [
       Markup.button.callback(
-        "⬆️ Раздел вверх",
-        `admin_internship_section_up_${sec.id}_${partId}`
-      ),
-      Markup.button.callback(
-        "⬇️ Раздел вниз",
-        `admin_internship_section_down_${sec.id}_${partId}`
+        sec.duration_days
+          ? `📅 Изменить срок для раздела (${sec.duration_days} дн.)`
+          : "📅 Добавить срок для раздела",
+        `admin_internship_section_duration_${sec.id}_${partId}`
       ),
     ],
+
+    [
+      Markup.button.callback(
+        "📋 Этапы раздела",
+        `admin_internship_section_steps_${sec.id}_${partId}`
+      ),
+    ],
+
     [
       Markup.button.callback(
         "🗑 Удалить раздел",
@@ -1993,7 +1911,374 @@ async function showInternshipSection(ctx, sectionId, partId) {
   await deliver(ctx, { text, extra: keyboard }, { edit: true });
 }
 
+// ---------- ПОРЯДОК (СЕКЦИИ/ЭТАПЫ) + ЭКРАНЫ ЭТАПОВ В АДМИНКЕ ----------
+
+// кэш наличия колонок (чтобы не падать, если колонка ещё не добавлена)
+const __colExistsCache = new Map(); // key: "table.column" -> boolean
+async function columnExists(tableName, columnName) {
+  const key = `${tableName}.${columnName}`;
+  if (__colExistsCache.has(key)) return __colExistsCache.get(key);
+
+  const res = await pool.query(
+    `
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = $1
+        AND column_name = $2
+      LIMIT 1
+    `,
+    [tableName, columnName]
+  );
+
+  const ok = res.rows.length > 0;
+  __colExistsCache.set(key, ok);
+  return ok;
+}
+
+// swap order_index между текущим и соседом (надежнее, чем +/- 1)
+async function swapOrderIndex({ table, id, scopeWhereSql, scopeParams, dir }) {
+  // dir: "up" => ищем соседа с меньшим order_index, "down" => с большим
+  const curRes = await pool.query(
+    `SELECT id, order_index FROM ${table} WHERE id = $1 LIMIT 1`,
+    [id]
+  );
+  if (!curRes.rows.length) return false;
+  const cur = curRes.rows[0];
+  const curIdx = Number(cur.order_index ?? 0);
+
+  const op = dir === "up" ? "<" : ">";
+  const order = dir === "up" ? "DESC" : "ASC";
+
+  const neighborRes = await pool.query(
+    `
+      SELECT id, order_index
+      FROM ${table}
+      WHERE ${scopeWhereSql}
+        AND order_index ${op} $${scopeParams.length + 1}
+      ORDER BY order_index ${order}, id ${order}
+      LIMIT 1
+    `,
+    [...scopeParams, curIdx]
+  );
+
+  if (!neighborRes.rows.length) return false;
+  const nb = neighborRes.rows[0];
+
+  // swap
+  await pool.query(`UPDATE ${table} SET order_index = $1 WHERE id = $2`, [
+    nb.order_index,
+    cur.id,
+  ]);
+  await pool.query(`UPDATE ${table} SET order_index = $1 WHERE id = $2`, [
+    cur.order_index,
+    nb.id,
+  ]);
+
+  return true;
+}
+
+// режим изменения порядка РАЗДЕЛОВ внутри ЧАСТИ
+async function showInternshipPartSectionsReorder(ctx, partId) {
+  const pRes = await pool.query(
+    "SELECT id, title, order_index FROM internship_parts WHERE id = $1",
+    [partId]
+  );
+  if (!pRes.rows.length) return ctx.reply("Часть стажировки не найдена.");
+  const part = pRes.rows[0];
+
+  const secRes = await pool.query(
+    `
+      SELECT id, title, order_index
+      FROM internship_sections
+      WHERE part_id = $1
+      ORDER BY order_index ASC, id ASC
+    `,
+    [partId]
+  );
+  const sections = secRes.rows;
+
+  let text =
+    `📚 Разделы (режим изменения порядка)
+
+` +
+    `Часть: ${part.title}
+
+` +
+    `Нажимай стрелки ⬆️ / ⬇️ рядом с разделами, затем нажми «✅ Закончить».
+`;
+
+  const buttons = [];
+
+  for (const sec of sections) {
+    const row = [];
+    row.push(Markup.button.callback(`${sec.title}`, "noop"));
+    row.push(
+      Markup.button.callback(
+        "⬆️",
+        `admin_internship_section_move_up_${partId}_${sec.id}`
+      )
+    );
+    row.push(
+      Markup.button.callback(
+        "⬇️",
+        `admin_internship_section_move_down_${partId}_${sec.id}`
+      )
+    );
+    buttons.push(row);
+  }
+
+  buttons.push([
+    Markup.button.callback(
+      "✅ Закончить изменение порядка",
+      `admin_internship_part_sections_reorder_done_${partId}`
+    ),
+  ]);
+  buttons.push([
+    Markup.button.callback("🔙 К части", `admin_internship_part_${partId}`),
+  ]);
+
+  await deliver(
+    ctx,
+    { text, extra: Markup.inlineKeyboard(buttons) },
+    { edit: true }
+  );
+}
+
+// список ЭТАПОВ раздела
+async function showInternshipSectionSteps(ctx, sectionId, partId) {
+  const secRes = await pool.query(
+    `SELECT id, title FROM internship_sections WHERE id = $1 LIMIT 1`,
+    [sectionId]
+  );
+  if (!secRes.rows.length) return ctx.reply("Раздел не найден.");
+  const sec = secRes.rows[0];
+
+  const stepRes = await pool.query(
+    `
+      SELECT id, title, order_index
+      FROM internship_steps
+      WHERE section_id = $1
+      ORDER BY order_index ASC, id ASC
+    `,
+    [sectionId]
+  );
+  const steps = stepRes.rows;
+
+  let text = `🎯 Этапы раздела: ${sec.title}
+
+`;
+
+  const buttons = [];
+
+  for (const st of steps) {
+    buttons.push([
+      Markup.button.callback(
+        st.title,
+        `admin_internship_step_edit_${st.id}_${sectionId}_${partId}`
+      ),
+    ]);
+  }
+
+  buttons.push([
+    Markup.button.callback(
+      "➕ Добавить этап",
+      `admin_internship_step_new_${sectionId}_${partId}`
+    ),
+  ]);
+  buttons.push([
+    Markup.button.callback(
+      "🔁 Изменить последовательность",
+      `admin_internship_steps_reorder_${sectionId}_${partId}`
+    ),
+  ]);
+  buttons.push([
+    Markup.button.callback(
+      "🔙 К разделу",
+      `admin_internship_section_edit_${sectionId}_${partId}`
+    ),
+  ]);
+
+  await deliver(
+    ctx,
+    { text, extra: Markup.inlineKeyboard(buttons) },
+    { edit: true }
+  );
+}
+
+async function showInternshipSectionStepsReorder(ctx, sectionId, partId) {
+  const secRes = await pool.query(
+    `SELECT id, title FROM internship_sections WHERE id = $1 LIMIT 1`,
+    [sectionId]
+  );
+  if (!secRes.rows.length) return ctx.reply("Раздел не найден.");
+  const sec = secRes.rows[0];
+
+  const stepRes = await pool.query(
+    `
+      SELECT id, title, order_index
+      FROM internship_steps
+      WHERE section_id = $1
+      ORDER BY order_index ASC, id ASC
+    `,
+    [sectionId]
+  );
+  const steps = stepRes.rows;
+
+  let text =
+    `🎯 Этапы (режим изменения порядка)
+
+` +
+    `Раздел: ${sec.title}
+
+` +
+    `Нажимай стрелки ⬆️ / ⬇️ рядом с этапами, затем нажми «✅ Закончить».
+`;
+
+  const buttons = [];
+
+  for (const st of steps) {
+    const row = [];
+    row.push(Markup.button.callback(`${st.title}`, "noop"));
+    row.push(
+      Markup.button.callback(
+        "⬆️",
+        `admin_internship_step_move_up_${sectionId}_${st.id}_${partId}`
+      )
+    );
+    row.push(
+      Markup.button.callback(
+        "⬇️",
+        `admin_internship_step_move_down_${sectionId}_${st.id}_${partId}`
+      )
+    );
+    buttons.push(row);
+  }
+
+  buttons.push([
+    Markup.button.callback(
+      "✅ Закончить изменение порядка",
+      `admin_internship_steps_reorder_done_${sectionId}_${partId}`
+    ),
+  ]);
+  buttons.push([
+    Markup.button.callback(
+      "🔙 К этапам",
+      `admin_internship_section_steps_${sectionId}_${partId}`
+    ),
+  ]);
+
+  await deliver(
+    ctx,
+    { text, extra: Markup.inlineKeyboard(buttons) },
+    { edit: true }
+  );
+}
+
+// настройки конкретного ЭТАПА
+async function showInternshipStepSettings(ctx, stepId, sectionId, partId) {
+  const hasStepTelegraph = await columnExists(
+    "internship_steps",
+    "telegraph_url"
+  );
+  const hasStepDuration = await columnExists(
+    "internship_steps",
+    "planned_duration_min"
+  );
+
+  const cols = ["id", "title", "step_type", "order_index"];
+  if (hasStepTelegraph) cols.push("telegraph_url");
+  if (hasStepDuration) cols.push("planned_duration_min");
+
+  const sRes = await pool.query(
+    `SELECT ${cols.join(", ")} FROM internship_steps WHERE id = $1 LIMIT 1`,
+    [stepId]
+  );
+  if (!sRes.rows.length) return ctx.reply("Этап не найден.");
+  const st = sRes.rows[0];
+
+  const typeLabel =
+    st.step_type === "video"
+      ? "Видео"
+      : st.step_type === "photo"
+      ? "Фото"
+      : "Обычная кнопка";
+
+  let text =
+    `Этап стажировки:
+` +
+    `Название: ${st.title}
+` +
+    `Тип: ${typeLabel}
+`;
+
+  if (hasStepTelegraph) {
+    text += `Telegraph: ${st.telegraph_url ? "✅ прикреплён" : "❌ нет"}
+`;
+  }
+  if (hasStepDuration) {
+    text += `Срок: ${
+      st.planned_duration_min ? `${st.planned_duration_min} мин.` : "не указан"
+    }
+`;
+  }
+
+  const rows = [];
+
+  rows.push([
+    Markup.button.callback(
+      "✏️ Переименовать этап",
+      `admin_internship_step_rename2_${st.id}_${sectionId}_${partId}`
+    ),
+  ]);
+
+  if (hasStepTelegraph) {
+    rows.push([
+      Markup.button.callback(
+        "📝 Telegraph (для этапа)",
+        `admin_internship_step_telegraph_${st.id}_${sectionId}_${partId}`
+      ),
+    ]);
+  }
+
+  if (hasStepDuration) {
+    rows.push([
+      Markup.button.callback(
+        st.planned_duration_min
+          ? `⏱ Изменить срок этапа (${st.planned_duration_min} мин.)`
+          : "⏱ Добавить срок этапа",
+        `admin_internship_step_duration_${st.id}_${sectionId}_${partId}`
+      ),
+    ]);
+  }
+
+  rows.push([
+    Markup.button.callback(
+      "🗑 Удалить этап",
+      `admin_internship_step_del2_${st.id}_${sectionId}_${partId}`
+    ),
+  ]);
+
+  rows.push([
+    Markup.button.callback(
+      "🔙 К этапам раздела",
+      `admin_internship_section_steps_${sectionId}_${partId}`
+    ),
+  ]);
+
+  await deliver(
+    ctx,
+    { text, extra: Markup.inlineKeyboard(rows) },
+    { edit: true }
+  );
+}
+
 function registerInternship(bot, ensureUser, logError, showMainMenu) {
+  // заглушка для кнопок без действия (чтобы Telegram не крутил "часики")
+  bot.action("noop", async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+  });
+
   bot.action(
     /^admin_internship_section_prev_(\d+)_(\d+)_(\d+)$/,
     async (ctx) => {
@@ -2023,6 +2308,33 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
       }
     }
   );
+
+  bot.action(/^admin_internship_section_duration_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const sectionId = parseInt(ctx.match[1], 10);
+      const partId = parseInt(ctx.match[2], 10);
+
+      configStates.set(ctx.from.id, {
+        mode: "await_section_duration",
+        sectionId,
+        partId,
+      });
+
+      await deliver(
+        ctx,
+        {
+          text: "📅 Введите срок для раздела в днях (целое число). Чтобы очистить — пришлите: -",
+        },
+        { edit: true }
+      );
+    } catch (err) {
+      logError("admin_internship_section_duration_x", err);
+    }
+  });
 
   bot.action(
     /^admin_internship_section_next_(\d+)_(\d+)_(\d+)$/,
@@ -2271,7 +2583,9 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
         const sessionId = parseInt(ctx.match[1], 10);
         const partId = parseInt(ctx.match[2], 10);
         const userId = parseInt(ctx.match[3], 10);
-        await showSessionPart(ctx, sessionId, partId, userId);
+        await showSessionPartSections(ctx, sessionId, partId, userId, {
+          edit: true,
+        });
       } catch (err) {
         logError("admin_internship_session_part_x", err);
       }
@@ -2296,6 +2610,8 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
   );
 
   // toggle простого этапа
+  // Формат callback (новый): admin_internship_step_toggle_{sessionId}_{sectionId}_{stepId}_{userId}
+  // Старый формат тоже поддерживаем: admin_internship_step_toggle_{sessionId}_{stepId}_{partId}_{userId}
   bot.action(
     /^admin_internship_step_toggle_(\d+)_(\d+)_(\d+)_(\d+)$/,
     async (ctx) => {
@@ -2305,12 +2621,41 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
         if (!isAdmin(admin)) return;
 
         const sessionId = parseInt(ctx.match[1], 10);
-        const stepId = parseInt(ctx.match[2], 10);
-        const partId = parseInt(ctx.match[3], 10);
+        const a = parseInt(ctx.match[2], 10);
+        const b = parseInt(ctx.match[3], 10);
         const userId = parseInt(ctx.match[4], 10);
 
+        let sectionId = a;
+        let stepId = b;
+
+        // если это старый формат, то (a=stepId, b=partId)
+        // пробуем понять по данным: у stepId должен быть section_id = sectionId
+        const check = await pool.query(
+          `SELECT id, section_id FROM internship_steps WHERE id = $1 LIMIT 1`,
+          [stepId]
+        );
+
+        if (!check.rows.length || check.rows[0].section_id !== sectionId) {
+          // старый формат
+          stepId = a;
+          const stepRes = await pool.query(
+            `SELECT section_id FROM internship_steps WHERE id = $1 LIMIT 1`,
+            [stepId]
+          );
+          sectionId = stepRes.rows[0]?.section_id || null;
+        }
+
+        if (!sectionId) {
+          await ctx.reply(
+            "Не удалось определить раздел для этого этапа (section_id пуст)."
+          );
+          return;
+        }
+
         await toggleSimpleStep(sessionId, stepId, admin.id);
-        await showSessionPart(ctx, sessionId, partId, userId);
+        await showSessionSection(ctx, sessionId, sectionId, userId, {
+          edit: true,
+        });
       } catch (err) {
         logError("admin_internship_step_toggle_x", err);
       }
@@ -2318,6 +2663,8 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
   );
 
   // запрос / просмотр медиа для этапа
+  // Формат callback (новый): admin_internship_step_media_{sessionId}_{sectionId}_{stepId}_{userId}
+  // Старый формат тоже поддерживаем: admin_internship_step_media_{sessionId}_{stepId}_{partId}_{userId}
   bot.action(
     /^admin_internship_step_media_(\d+)_(\d+)_(\d+)_(\d+)$/,
     async (ctx) => {
@@ -2327,40 +2674,72 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
         if (!isAdmin(admin)) return;
 
         const sessionId = parseInt(ctx.match[1], 10);
-        const stepId = parseInt(ctx.match[2], 10);
-        const partId = parseInt(ctx.match[3], 10);
+        const a = parseInt(ctx.match[2], 10);
+        const b = parseInt(ctx.match[3], 10);
         const userId = parseInt(ctx.match[4], 10);
 
-        const stepRes = await pool.query(
-          "SELECT step_type, title FROM internship_steps WHERE id = $1",
+        let sectionId = a;
+        let stepId = b;
+
+        // определить формат (новый/старый)
+        const check = await pool.query(
+          `SELECT id, section_id, step_type, title FROM internship_steps WHERE id = $1 LIMIT 1`,
           [stepId]
         );
-        if (!stepRes.rows.length) {
+
+        let stepRow = check.rows[0] || null;
+
+        if (!stepRow || stepRow.section_id !== sectionId) {
+          // старый формат
+          stepId = a;
+          const stepRes = await pool.query(
+            `SELECT id, section_id, step_type, title FROM internship_steps WHERE id = $1 LIMIT 1`,
+            [stepId]
+          );
+          stepRow = stepRes.rows[0] || null;
+          sectionId = stepRow?.section_id || null;
+        }
+
+        if (!stepRow) {
           await ctx.reply("Этап не найден.");
           return;
         }
-        const step = stepRes.rows[0];
+        if (!sectionId) {
+          await ctx.reply(
+            "Не удалось определить раздел для этого этапа (section_id пуст)."
+          );
+          return;
+        }
+
+        // если вдруг по ошибке сюда пришёл simple — просто переключим
+        if (stepRow.step_type === "simple") {
+          await toggleSimpleStep(sessionId, stepId, admin.id);
+          await showSessionSection(ctx, sessionId, sectionId, userId, {
+            edit: true,
+          });
+          return;
+        }
 
         // проверяем, есть ли уже сохранённое медиа
         const rRes = await pool.query(
           `
-          SELECT media_file_id
-          FROM internship_step_results
-          WHERE session_id = $1 AND step_id = $2
-        `,
+        SELECT media_file_id
+        FROM internship_step_results
+        WHERE session_id = $1 AND step_id = $2
+      `,
           [sessionId, stepId]
         );
         const existingFileId = rRes.rows[0]?.media_file_id || null;
 
         if (existingFileId) {
           // показываем текущее медиа и предлагаем заменить
-          if (step.step_type === "video") {
+          if (stepRow.step_type === "video") {
             await ctx.replyWithVideo(existingFileId, {
-              caption: `Сейчас для этапа "${step.title}" сохранено это видео.`,
+              caption: `Сейчас для этапа "${stepRow.title}" сохранено это видео.`,
             });
-          } else if (step.step_type === "photo") {
+          } else if (stepRow.step_type === "photo") {
             await ctx.replyWithPhoto(existingFileId, {
-              caption: `Сейчас для этапа "${step.title}" сохранено это фото.`,
+              caption: `Сейчас для этапа "${stepRow.title}" сохранено это фото.`,
             });
           }
 
@@ -2368,13 +2747,13 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
             [
               Markup.button.callback(
                 "🔁 Заменить файл",
-                `admin_internship_step_media_replace_${sessionId}_${stepId}_${partId}_${userId}`
+                `admin_internship_step_media_replace_${sessionId}_${sectionId}_${stepId}_${userId}`
               ),
             ],
             [
               Markup.button.callback(
                 "🔙 Назад к этапам",
-                `admin_internship_session_part_${sessionId}_${partId}_${userId}`
+                `admin_internship_session_section_${sessionId}_${sectionId}_${userId}`
               ),
             ],
           ]);
@@ -2387,21 +2766,21 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
 
         // если медиа ещё нет — сразу просим отправить
         const typeText =
-          step.step_type === "video"
+          stepRow.step_type === "video"
             ? "видео"
-            : step.step_type === "photo"
+            : stepRow.step_type === "photo"
             ? "фото"
             : "медиа";
 
         await ctx.reply(
-          `Отправь ${typeText} для этапа:\n"${step.title}"\n\nКак только файл будет получен, этап автоматически отметится как ✅.`
+          `Отправь ${typeText} для этапа:\n"${stepRow.title}"\n\nКак только файл будет получен, этап автоматически отметится как ✅.`
         );
 
         mediaStates.set(ctx.from.id, {
           sessionId,
+          sectionId,
           stepId,
-          type: step.step_type,
-          partId,
+          type: stepRow.step_type,
           userId,
         });
       } catch (err) {
@@ -2549,6 +2928,8 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
   );
 
   // режим "заменить файл" для медиа-этапа
+  // Формат callback (новый): admin_internship_step_media_replace_{sessionId}_{sectionId}_{stepId}_{userId}
+  // Старый формат тоже поддерживаем: admin_internship_step_media_replace_{sessionId}_{stepId}_{partId}_{userId}
   bot.action(
     /^admin_internship_step_media_replace_(\d+)_(\d+)_(\d+)_(\d+)$/,
     async (ctx) => {
@@ -2558,36 +2939,58 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
         if (!isAdmin(admin)) return;
 
         const sessionId = parseInt(ctx.match[1], 10);
-        const stepId = parseInt(ctx.match[2], 10);
-        const partId = parseInt(ctx.match[3], 10);
+        const a = parseInt(ctx.match[2], 10);
+        const b = parseInt(ctx.match[3], 10);
         const userId = parseInt(ctx.match[4], 10);
 
-        const stepRes = await pool.query(
-          "SELECT step_type, title FROM internship_steps WHERE id = $1",
+        let sectionId = a;
+        let stepId = b;
+
+        // определить формат
+        const chk = await pool.query(
+          `SELECT id, section_id, step_type, title FROM internship_steps WHERE id = $1 LIMIT 1`,
           [stepId]
         );
-        if (!stepRes.rows.length) {
+        let stepRow = chk.rows[0] || null;
+
+        if (!stepRow || stepRow.section_id !== sectionId) {
+          // старый формат
+          stepId = a;
+          const stepRes = await pool.query(
+            `SELECT id, section_id, step_type, title FROM internship_steps WHERE id = $1 LIMIT 1`,
+            [stepId]
+          );
+          stepRow = stepRes.rows[0] || null;
+          sectionId = stepRow?.section_id || null;
+        }
+
+        if (!stepRow) {
           await ctx.reply("Этап не найден.");
           return;
         }
-        const step = stepRes.rows[0];
+        if (!sectionId) {
+          await ctx.reply(
+            "Не удалось определить раздел для этого этапа (section_id пуст)."
+          );
+          return;
+        }
 
         const typeText =
-          step.step_type === "video"
+          stepRow.step_type === "video"
             ? "видео"
-            : step.step_type === "photo"
+            : stepRow.step_type === "photo"
             ? "фото"
             : "медиа";
 
         await ctx.reply(
-          `Отправь новое ${typeText} для этапа:\n"${step.title}"\n\nТекущий файл будет заменён, этап останется отмеченным как ✅.`
+          `Отправь новое ${typeText} для этапа:\n"${stepRow.title}"\n\nТекущий файл будет заменён, этап останется отмеченным как ✅.`
         );
 
         mediaStates.set(ctx.from.id, {
           sessionId,
+          sectionId,
           stepId,
-          type: step.step_type,
-          partId,
+          type: stepRow.step_type,
           userId,
         });
       } catch (err) {
@@ -2596,59 +2999,6 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
     }
   );
 
-  // отменить день — сначала спрашиваем подтверждение
-  bot.action(/^admin_internship_cancel_(\d+)_(\d+)$/, async (ctx) => {
-    try {
-      await ctx.answerCbQuery().catch(() => {});
-      const admin = await ensureUser(ctx);
-      if (!isAdmin(admin)) return;
-
-      const sessionId = parseInt(ctx.match[1], 10);
-      const userId = parseInt(ctx.match[2], 10);
-
-      const keyboard = Markup.inlineKeyboard([
-        [
-          Markup.button.callback(
-            "🗑 Да, отменить день",
-            `admin_internship_cancel_confirm_${sessionId}_${userId}`
-          ),
-        ],
-        [
-          Markup.button.callback(
-            "🔙 Не отменять",
-            `admin_user_internship_${userId}`
-          ),
-        ],
-      ]);
-
-      await deliver(
-        ctx,
-        {
-          text: "Точно отменить текущий день стажировки? День не будет засчитан.",
-          extra: keyboard,
-        },
-        { edit: true }
-      );
-    } catch (err) {
-      logError("admin_internship_cancel_x", err);
-    }
-  });
-
-  bot.action(/^admin_internship_cancel_confirm_(\d+)_(\d+)$/, async (ctx) => {
-    try {
-      await ctx.answerCbQuery().catch(() => {});
-      const admin = await ensureUser(ctx);
-      if (!isAdmin(admin)) return;
-
-      const sessionId = parseInt(ctx.match[1], 10);
-      const userId = parseInt(ctx.match[2], 10);
-
-      await cancelInternshipSession(ctx, sessionId);
-      await showUserInternshipMenu(ctx, admin, userId);
-    } catch (err) {
-      logError("admin_internship_cancel_confirm_x", err);
-    }
-  });
   // отменить день — сначала спрашиваем подтверждение
   bot.action(/^admin_internship_cancel_(\d+)_(\d+)$/, async (ctx) => {
     try {
@@ -2781,6 +3131,286 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
     }
   });
 
+  // изменить порядок разделов внутри части
+  bot.action(/^admin_internship_part_sections_reorder_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+      const partId = parseInt(ctx.match[1], 10);
+      await showInternshipPartSectionsReorder(ctx, partId);
+    } catch (err) {
+      logError("admin_internship_part_sections_reorder_x", err);
+    }
+  });
+
+  bot.action(
+    /^admin_internship_part_sections_reorder_done_(\d+)$/,
+    async (ctx) => {
+      try {
+        await ctx.answerCbQuery().catch(() => {});
+        const admin = await ensureUser(ctx);
+        if (!isAdmin(admin)) return;
+        const partId = parseInt(ctx.match[1], 10);
+        await showInternshipPart(ctx, partId);
+      } catch (err) {
+        logError("admin_internship_part_sections_reorder_done_x", err);
+      }
+    }
+  );
+
+  bot.action(
+    /^admin_internship_section_move_(up|down)_(\d+)_(\d+)$/,
+    async (ctx) => {
+      try {
+        await ctx.answerCbQuery().catch(() => {});
+        const admin = await ensureUser(ctx);
+        if (!isAdmin(admin)) return;
+
+        const dir = ctx.match[1];
+        const partId = parseInt(ctx.match[2], 10);
+        const sectionId = parseInt(ctx.match[3], 10);
+
+        await swapOrderIndex({
+          table: "internship_sections",
+          id: sectionId,
+          scopeWhereSql: "part_id = $1",
+          scopeParams: [partId],
+          dir,
+        });
+
+        await showInternshipPartSectionsReorder(ctx, partId);
+      } catch (err) {
+        logError("admin_internship_section_move_x", err);
+      }
+    }
+  );
+
+  // список этапов раздела
+  bot.action(/^admin_internship_section_steps_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const sectionId = parseInt(ctx.match[1], 10);
+      const partId = parseInt(ctx.match[2], 10);
+
+      await showInternshipSectionSteps(ctx, sectionId, partId);
+    } catch (err) {
+      logError("admin_internship_section_steps_x", err);
+    }
+  });
+
+  // режим изменения порядка этапов
+  bot.action(/^admin_internship_steps_reorder_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const sectionId = parseInt(ctx.match[1], 10);
+      const partId = parseInt(ctx.match[2], 10);
+
+      await showInternshipSectionStepsReorder(ctx, sectionId, partId);
+    } catch (err) {
+      logError("admin_internship_steps_reorder_x", err);
+    }
+  });
+
+  bot.action(
+    /^admin_internship_steps_reorder_done_(\d+)_(\d+)$/,
+    async (ctx) => {
+      try {
+        await ctx.answerCbQuery().catch(() => {});
+        const admin = await ensureUser(ctx);
+        if (!isAdmin(admin)) return;
+
+        const sectionId = parseInt(ctx.match[1], 10);
+        const partId = parseInt(ctx.match[2], 10);
+
+        await showInternshipSectionSteps(ctx, sectionId, partId);
+      } catch (err) {
+        logError("admin_internship_steps_reorder_done_x", err);
+      }
+    }
+  );
+
+  bot.action(
+    /^admin_internship_step_move_(up|down)_(\d+)_(\d+)_(\d+)$/,
+    async (ctx) => {
+      try {
+        await ctx.answerCbQuery().catch(() => {});
+        const admin = await ensureUser(ctx);
+        if (!isAdmin(admin)) return;
+
+        const dir = ctx.match[1];
+        const sectionId = parseInt(ctx.match[2], 10);
+        const stepId = parseInt(ctx.match[3], 10);
+        const partId = parseInt(ctx.match[4], 10);
+
+        await swapOrderIndex({
+          table: "internship_steps",
+          id: stepId,
+          scopeWhereSql: "section_id = $1",
+          scopeParams: [sectionId],
+          dir,
+        });
+
+        await showInternshipSectionStepsReorder(ctx, sectionId, partId);
+      } catch (err) {
+        logError("admin_internship_step_move_x", err);
+      }
+    }
+  );
+
+  // настройки этапа
+  bot.action(/^admin_internship_step_edit_(\d+)_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const stepId = parseInt(ctx.match[1], 10);
+      const sectionId = parseInt(ctx.match[2], 10);
+      const partId = parseInt(ctx.match[3], 10);
+
+      configStates.delete(ctx.from.id);
+      await showInternshipStepSettings(ctx, stepId, sectionId, partId);
+    } catch (err) {
+      logError("admin_internship_step_edit_x", err);
+    }
+  });
+
+  bot.action(
+    /^admin_internship_step_telegraph_(\d+)_(\d+)_(\d+)$/,
+    async (ctx) => {
+      try {
+        await ctx.answerCbQuery().catch(() => {});
+        const admin = await ensureUser(ctx);
+        if (!isAdmin(admin)) return;
+
+        const stepId = parseInt(ctx.match[1], 10);
+        const sectionId = parseInt(ctx.match[2], 10);
+        const partId = parseInt(ctx.match[3], 10);
+
+        // если колонки нет — просто не даём включить
+        const ok = await columnExists("internship_steps", "telegraph_url");
+        if (!ok) {
+          await ctx.reply(
+            "В таблице internship_steps нет колонки telegraph_url. Добавь её, если хочешь Telegraph для этапов."
+          );
+          return;
+        }
+
+        configStates.set(ctx.from.id, {
+          mode: "await_step_telegraph",
+          stepId,
+          sectionId,
+          partId,
+        });
+
+        await deliver(
+          ctx,
+          {
+            text:
+              "📝 Пришли ссылку Telegraph для этого этапа одним сообщением.\n\n" +
+              "Пример: https://telegra.ph/....\n" +
+              "Чтобы очистить — пришли: -",
+          },
+          { edit: true }
+        );
+      } catch (err) {
+        logError("admin_internship_step_telegraph_x", err);
+      }
+    }
+  );
+
+  bot.action(
+    /^admin_internship_step_duration_(\d+)_(\d+)_(\d+)$/,
+    async (ctx) => {
+      try {
+        await ctx.answerCbQuery().catch(() => {});
+        const admin = await ensureUser(ctx);
+        if (!isAdmin(admin)) return;
+
+        const stepId = parseInt(ctx.match[1], 10);
+        const sectionId = parseInt(ctx.match[2], 10);
+        const partId = parseInt(ctx.match[3], 10);
+
+        const ok = await columnExists(
+          "internship_steps",
+          "planned_duration_min"
+        );
+        if (!ok) {
+          await ctx.reply(
+            "В таблице internship_steps нет колонки planned_duration_min."
+          );
+          return;
+        }
+
+        configStates.set(ctx.from.id, {
+          mode: "await_step_duration",
+          stepId,
+          sectionId,
+          partId,
+        });
+
+        await deliver(
+          ctx,
+          {
+            text: "⏱ Введите срок этапа в минутах (целое число). Чтобы очистить — пришлите: -",
+          },
+          { edit: true }
+        );
+      } catch (err) {
+        logError("admin_internship_step_duration_x", err);
+      }
+    }
+  );
+
+  bot.action(
+    /^admin_internship_step_rename2_(\d+)_(\d+)_(\d+)$/,
+    async (ctx) => {
+      try {
+        await ctx.answerCbQuery().catch(() => {});
+        const admin = await ensureUser(ctx);
+        if (!isAdmin(admin)) return;
+
+        const stepId = parseInt(ctx.match[1], 10);
+        const sectionId = parseInt(ctx.match[2], 10);
+        const partId = parseInt(ctx.match[3], 10);
+
+        configStates.set(ctx.from.id, {
+          mode: "rename_step2",
+          stepId,
+          sectionId,
+          partId,
+        });
+        await ctx.reply("Отправь новое название этапа одним сообщением.");
+      } catch (err) {
+        logError("admin_internship_step_rename2_x", err);
+      }
+    }
+  );
+
+  bot.action(/^admin_internship_step_del2_(\d+)_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+      if (!isAdmin(admin)) return;
+
+      const stepId = parseInt(ctx.match[1], 10);
+      const sectionId = parseInt(ctx.match[2], 10);
+      const partId = parseInt(ctx.match[3], 10);
+
+      await pool.query("DELETE FROM internship_steps WHERE id = $1", [stepId]);
+      await showInternshipSectionSteps(ctx, sectionId, partId);
+    } catch (err) {
+      logError("admin_internship_step_del2_x", err);
+    }
+  });
+
   // ===== РАЗДЕЛЫ (админка настройки стажировки) =====
 
   bot.action(/^admin_internship_section_new_(\d+)$/, async (ctx) => {
@@ -2790,7 +3420,10 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
       if (!isAdmin(admin)) return;
 
       const partId = parseInt(ctx.match[1], 10);
-      configStates.set(ctx.from.id, { mode: "new_section", partId });
+      configStates.set(ctx.from.id, {
+        mode: "new_section_title",
+        partId,
+      });
 
       await ctx.reply("Отправь название нового раздела одним сообщением.");
     } catch (err) {
@@ -2868,45 +3501,8 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
     }
   });
 
-  bot.action(/^admin_internship_section_up_(\d+)_(\d+)$/, async (ctx) => {
-    try {
-      await ctx.answerCbQuery().catch(() => {});
-      const admin = await ensureUser(ctx);
-      if (!isAdmin(admin)) return;
-
-      const sectionId = parseInt(ctx.match[1], 10);
-      const partId = parseInt(ctx.match[2], 10);
-
-      await pool.query(
-        `UPDATE internship_sections SET order_index = order_index - 1 WHERE id=$1`,
-        [sectionId]
-      );
-
-      await showInternshipPart(ctx, partId);
-    } catch (err) {
-      logError("admin_internship_section_up_x", err);
-    }
-  });
-
-  bot.action(/^admin_internship_section_down_(\d+)_(\d+)$/, async (ctx) => {
-    try {
-      await ctx.answerCbQuery().catch(() => {});
-      const admin = await ensureUser(ctx);
-      if (!isAdmin(admin)) return;
-
-      const sectionId = parseInt(ctx.match[1], 10);
-      const partId = parseInt(ctx.match[2], 10);
-
-      await pool.query(
-        `UPDATE internship_sections SET order_index = order_index + 1 WHERE id=$1`,
-        [sectionId]
-      );
-
-      await showInternshipPart(ctx, partId);
-    } catch (err) {
-      logError("admin_internship_section_down_x", err);
-    }
-  });
+  // NOTE: старые admin_internship_section_up/down удалены.
+  // Порядок разделов меняем только через режим "🔁 Изменить последовательность".
 
   bot.action(/^admin_internship_section_del_(\d+)_(\d+)$/, async (ctx) => {
     try {
@@ -2923,48 +3519,6 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
       await showInternshipPart(ctx, partId);
     } catch (err) {
       logError("admin_internship_section_del_x", err);
-    }
-  });
-
-  bot.action(/^admin_internship_part_up_(\d+)$/, async (ctx) => {
-    try {
-      await ctx.answerCbQuery().catch(() => {});
-      const admin = await ensureUser(ctx);
-      if (!isAdmin(admin)) return;
-
-      const partId = parseInt(ctx.match[1], 10);
-      await pool.query(
-        `
-        UPDATE internship_parts
-        SET order_index = order_index - 1
-        WHERE id = $1
-      `,
-        [partId]
-      );
-      await showInternshipPart(ctx, partId);
-    } catch (err) {
-      logError("admin_internship_part_up_x", err);
-    }
-  });
-
-  bot.action(/^admin_internship_part_down_(\d+)$/, async (ctx) => {
-    try {
-      await ctx.answerCbQuery().catch(() => {});
-      const admin = await ensureUser(ctx);
-      if (!isAdmin(admin)) return;
-
-      const partId = parseInt(ctx.match[1], 10);
-      await pool.query(
-        `
-        UPDATE internship_parts
-        SET order_index = order_index + 1
-        WHERE id = $1
-      `,
-        [partId]
-      );
-      await showInternshipPart(ctx, partId);
-    } catch (err) {
-      logError("admin_internship_part_down_x", err);
     }
   });
 
@@ -3008,16 +3562,19 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
     }
   });
 
-  bot.action(/^admin_internship_step_new_(\d+)$/, async (ctx) => {
+  bot.action(/^admin_internship_step_new_(\d+)_(\d+)$/, async (ctx) => {
     try {
       await ctx.answerCbQuery().catch(() => {});
       const admin = await ensureUser(ctx);
       if (!isAdmin(admin)) return;
 
-      const partId = parseInt(ctx.match[1], 10);
+      const sectionId = parseInt(ctx.match[1], 10);
+      const partId = parseInt(ctx.match[2], 10);
+
       configStates.set(ctx.from.id, {
         mode: "new_step_title",
         partId,
+        sectionId,
       });
 
       await ctx.reply(
@@ -3025,227 +3582,6 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
       );
     } catch (err) {
       logError("admin_internship_step_new_x", err);
-    }
-  });
-
-  bot.action(/^admin_internship_step_(\d+)_(\d+)$/, async (ctx) => {
-    try {
-      await ctx.answerCbQuery().catch(() => {});
-      const admin = await ensureUser(ctx);
-      if (!isAdmin(admin)) return;
-
-      const stepId = parseInt(ctx.match[1], 10);
-      const partId = parseInt(ctx.match[2], 10);
-
-      const sRes = await pool.query(
-        `
-        SELECT id, title, step_type, order_index
-        FROM internship_steps
-        WHERE id = $1
-      `,
-        [stepId]
-      );
-      if (!sRes.rows.length) {
-        await ctx.reply("Этап не найден.");
-        return;
-      }
-      const step = sRes.rows[0];
-
-      let typeLabel =
-        step.step_type === "video"
-          ? "Видео"
-          : step.step_type === "photo"
-          ? "Фото"
-          : "Обычная кнопка";
-
-      let text =
-        `Этап стажировки:\n` +
-        `Название: ${step.title}\n` +
-        `Тип: ${typeLabel}\n` +
-        `Порядок: ${step.order_index}`;
-
-      const keyboard = Markup.inlineKeyboard([
-        [
-          Markup.button.callback(
-            "✏️ Переименовать",
-            `admin_internship_step_rename_${step.id}_${partId}`
-          ),
-        ],
-        [
-          Markup.button.callback(
-            "🔁 Изменить тип",
-            `admin_internship_step_type_${step.id}_${partId}`
-          ),
-        ],
-        [
-          Markup.button.callback(
-            "⬆️ Вверх",
-            `admin_internship_step_up_${step.id}_${partId}`
-          ),
-          Markup.button.callback(
-            "⬇️ Вниз",
-            `admin_internship_step_down_${step.id}_${partId}`
-          ),
-        ],
-        [
-          Markup.button.callback(
-            "🗑 Удалить этап",
-            `admin_internship_step_del_${step.id}_${partId}`
-          ),
-        ],
-        [
-          Markup.button.callback(
-            "🔙 К части",
-            `admin_internship_part_${partId}`
-          ),
-        ],
-      ]);
-
-      await deliver(ctx, { text, extra: keyboard }, { edit: true });
-    } catch (err) {
-      logError("admin_internship_step_x", err);
-    }
-  });
-
-  bot.action(/^admin_internship_step_rename_(\d+)_(\d+)$/, async (ctx) => {
-    try {
-      await ctx.answerCbQuery().catch(() => {});
-      const admin = await ensureUser(ctx);
-      if (!isAdmin(admin)) return;
-      const stepId = parseInt(ctx.match[1], 10);
-      const partId = parseInt(ctx.match[2], 10);
-
-      configStates.set(ctx.from.id, {
-        mode: "rename_step",
-        stepId,
-        partId,
-      });
-
-      await ctx.reply("Отправь новое название этапа одним сообщением.");
-    } catch (err) {
-      logError("admin_internship_step_rename_x", err);
-    }
-  });
-
-  bot.action(/^admin_internship_step_type_(\d+)_(\d+)$/, async (ctx) => {
-    try {
-      await ctx.answerCbQuery().catch(() => {});
-      const admin = await ensureUser(ctx);
-      if (!isAdmin(admin)) return;
-
-      const stepId = parseInt(ctx.match[1], 10);
-      const partId = parseInt(ctx.match[2], 10);
-
-      const keyboard = Markup.inlineKeyboard([
-        [
-          Markup.button.callback(
-            "🔘 Обычная кнопка",
-            `admin_internship_step_type_set_${stepId}_${partId}_simple`
-          ),
-        ],
-        [
-          Markup.button.callback(
-            "🎥 Видео",
-            `admin_internship_step_type_set_${stepId}_${partId}_video`
-          ),
-        ],
-        [
-          Markup.button.callback(
-            "📷 Фото",
-            `admin_internship_step_type_set_${stepId}_${partId}_photo`
-          ),
-        ],
-      ]);
-
-      await deliver(
-        ctx,
-        { text: "Выбери новый тип этапа:", extra: keyboard },
-        { edit: true }
-      );
-    } catch (err) {
-      logError("admin_internship_step_type_x", err);
-    }
-  });
-
-  bot.action(
-    /^admin_internship_step_type_set_(\d+)_(\d+)_(simple|video|photo)$/,
-    async (ctx) => {
-      try {
-        await ctx.answerCbQuery().catch(() => {});
-        const admin = await ensureUser(ctx);
-        if (!isAdmin(admin)) return;
-
-        const stepId = parseInt(ctx.match[1], 10);
-        const partId = parseInt(ctx.match[2], 10);
-        const type = ctx.match[3];
-
-        await pool.query(
-          "UPDATE internship_steps SET step_type = $1 WHERE id = $2",
-          [type, stepId]
-        );
-        await showInternshipPart(ctx, partId);
-      } catch (err) {
-        logError("admin_internship_step_type_set_x", err);
-      }
-    }
-  );
-
-  bot.action(/^admin_internship_step_up_(\d+)_(\d+)$/, async (ctx) => {
-    try {
-      await ctx.answerCbQuery().catch(() => {});
-      const admin = await ensureUser(ctx);
-      if (!isAdmin(admin)) return;
-      const stepId = parseInt(ctx.match[1], 10);
-      const partId = parseInt(ctx.match[2], 10);
-
-      await pool.query(
-        `
-        UPDATE internship_steps
-        SET order_index = order_index - 1
-        WHERE id = $1
-      `,
-        [stepId]
-      );
-      await showInternshipPart(ctx, partId);
-    } catch (err) {
-      logError("admin_internship_step_up_x", err);
-    }
-  });
-
-  bot.action(/^admin_internship_step_down_(\d+)_(\d+)$/, async (ctx) => {
-    try {
-      await ctx.answerCbQuery().catch(() => {});
-      const admin = await ensureUser(ctx);
-      if (!isAdmin(admin)) return;
-      const stepId = parseInt(ctx.match[1], 10);
-      const partId = parseInt(ctx.match[2], 10);
-
-      await pool.query(
-        `
-        UPDATE internship_steps
-        SET order_index = order_index + 1
-        WHERE id = $1
-      `,
-        [stepId]
-      );
-      await showInternshipPart(ctx, partId);
-    } catch (err) {
-      logError("admin_internship_step_down_x", err);
-    }
-  });
-
-  bot.action(/^admin_internship_step_del_(\d+)_(\d+)$/, async (ctx) => {
-    try {
-      await ctx.answerCbQuery().catch(() => {});
-      const admin = await ensureUser(ctx);
-      if (!isAdmin(admin)) return;
-      const stepId = parseInt(ctx.match[1], 10);
-      const partId = parseInt(ctx.match[2], 10);
-
-      await pool.query("DELETE FROM internship_steps WHERE id = $1", [stepId]);
-      await showInternshipPart(ctx, partId);
-    } catch (err) {
-      logError("admin_internship_step_del_x", err);
     }
   });
 
@@ -3406,6 +3742,167 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
         return;
       }
 
+      // === СРОК ДЛЯ РАЗДЕЛА (duration_days) ===
+      if (state.mode === "await_section_duration") {
+        if (text === "-") {
+          await pool.query(
+            "UPDATE internship_sections SET duration_days = NULL WHERE id = $1",
+            [state.sectionId]
+          );
+          configStates.delete(ctx.from.id);
+          await ctx.reply("✅ Срок очищен.");
+          await showInternshipSection(ctx, state.sectionId, state.partId);
+          return;
+        }
+
+        const days = parseInt(text, 10);
+        if (!Number.isInteger(days) || days <= 0) {
+          await ctx.reply("❌ Введите целое число > 0 (например: 3).");
+          return;
+        }
+
+        await pool.query(
+          "UPDATE internship_sections SET duration_days = $1 WHERE id = $2",
+          [days, state.sectionId]
+        );
+
+        configStates.delete(ctx.from.id);
+        await ctx.reply("✅ Срок сохранён.");
+        await showInternshipSection(ctx, state.sectionId, state.partId);
+        return;
+      }
+
+      // === TELEGRAPH ДЛЯ ЭТАПА ===
+      if (state.mode === "await_step_telegraph") {
+        const ok = await columnExists("internship_steps", "telegraph_url");
+        if (!ok) {
+          configStates.delete(ctx.from.id);
+          await ctx.reply(
+            "В таблице internship_steps нет колонки telegraph_url."
+          );
+          await showInternshipStepSettings(
+            ctx,
+            state.stepId,
+            state.sectionId,
+            state.partId
+          );
+          return;
+        }
+
+        if (text === "-") {
+          await pool.query(
+            "UPDATE internship_steps SET telegraph_url = NULL WHERE id = $1",
+            [state.stepId]
+          );
+          configStates.delete(ctx.from.id);
+          await ctx.reply("✅ Telegraph очищен.");
+          await showInternshipStepSettings(
+            ctx,
+            state.stepId,
+            state.sectionId,
+            state.partId
+          );
+          return;
+        }
+
+        if (!isTelegraphUrl(text)) {
+          await ctx.reply(
+            "❌ Пришли ссылку Telegraph вида https://telegra.ph/..."
+          );
+          return;
+        }
+
+        await pool.query(
+          "UPDATE internship_steps SET telegraph_url = $1 WHERE id = $2",
+          [text, state.stepId]
+        );
+
+        configStates.delete(ctx.from.id);
+        await ctx.reply("✅ Ссылка Telegraph сохранена.");
+        await showInternshipStepSettings(
+          ctx,
+          state.stepId,
+          state.sectionId,
+          state.partId
+        );
+        return;
+      }
+
+      // === СРОК ДЛЯ ЭТАПА (planned_duration_min) ===
+      if (state.mode === "await_step_duration") {
+        const ok = await columnExists(
+          "internship_steps",
+          "planned_duration_min"
+        );
+        if (!ok) {
+          configStates.delete(ctx.from.id);
+          await ctx.reply(
+            "В таблице internship_steps нет колонки planned_duration_min."
+          );
+          await showInternshipStepSettings(
+            ctx,
+            state.stepId,
+            state.sectionId,
+            state.partId
+          );
+          return;
+        }
+
+        if (text === "-") {
+          await pool.query(
+            "UPDATE internship_steps SET planned_duration_min = NULL WHERE id = $1",
+            [state.stepId]
+          );
+          configStates.delete(ctx.from.id);
+          await ctx.reply("✅ Срок очищен.");
+          await showInternshipStepSettings(
+            ctx,
+            state.stepId,
+            state.sectionId,
+            state.partId
+          );
+          return;
+        }
+
+        const mins = parseInt(text, 10);
+        if (!Number.isInteger(mins) || mins <= 0) {
+          await ctx.reply("❌ Введите целое число > 0 (например: 5).");
+          return;
+        }
+
+        await pool.query(
+          "UPDATE internship_steps SET planned_duration_min = $1 WHERE id = $2",
+          [mins, state.stepId]
+        );
+
+        configStates.delete(ctx.from.id);
+        await ctx.reply("✅ Срок сохранён.");
+        await showInternshipStepSettings(
+          ctx,
+          state.stepId,
+          state.sectionId,
+          state.partId
+        );
+        return;
+      }
+
+      // === ПЕРЕИМЕНОВАНИЕ ЭТАПА (новый экран) ===
+      if (state.mode === "rename_step2") {
+        await pool.query(
+          "UPDATE internship_steps SET title = $1 WHERE id = $2",
+          [text, state.stepId]
+        );
+        configStates.delete(ctx.from.id);
+        await ctx.reply("Название этапа обновлено.");
+        await showInternshipStepSettings(
+          ctx,
+          state.stepId,
+          state.sectionId,
+          state.partId
+        );
+        return;
+      }
+
       if (state.mode === "new_part") {
         const maxRes = await pool.query(
           "SELECT COALESCE(MAX(order_index), 0) AS max FROM internship_parts"
@@ -3427,14 +3924,16 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
 
       // 1) получили название этапа -> спрашиваем время в минутах
       if (state.mode === "new_step_title") {
+        const title = text;
         configStates.set(ctx.from.id, {
           mode: "new_step_duration",
           partId: state.partId,
-          title: text,
+          sectionId: state.sectionId,
+          title,
         });
 
         await ctx.reply(
-          "⏳ Введите плановое время прохождения этого этапа на стажировке (в минутах)."
+          "⏳ Введите плановое время прохождения этого этапа (в минутах)."
         );
         return;
       }
@@ -3452,6 +3951,7 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
         configStates.set(ctx.from.id, {
           mode: "new_step_type",
           partId: state.partId,
+          sectionId: state.sectionId,
           title: state.title,
           durationMin: minutes,
         });
@@ -3476,13 +3976,16 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
         return;
       }
 
-      if (state.mode === "rename_step") {
-        await pool.query(
-          "UPDATE internship_steps SET title = $1 WHERE id = $2",
-          [text, state.stepId]
+      // Создание нового раздела (админка)
+      if (state.mode === "new_section_title") {
+        const nextIndex = await getNextSectionOrderIndex(state.partId);
+        const ins = await pool.query(
+          `INSERT INTO internship_sections (part_id, title, order_index)
+           VALUES ($1, $2, $3) RETURNING id`,
+          [state.partId, text, nextIndex]
         );
         configStates.delete(ctx.from.id);
-        await ctx.reply("Название этапа обновлено.");
+        await ctx.reply(`Раздел создан (id: ${ins.rows[0].id}).`);
         await showInternshipPart(ctx, state.partId);
         return;
       }
@@ -3504,26 +4007,26 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
       if (!state || state.mode !== "new_step_type") return;
 
       const type = ctx.match[1];
-      const { partId, title, durationMin } = state;
+      const { partId, sectionId, title, durationMin } = state;
 
       const maxRes = await pool.query(
-        "SELECT COALESCE(MAX(order_index), 0) AS max FROM internship_steps WHERE part_id = $1",
-        [partId]
+        "SELECT COALESCE(MAX(order_index), 0) AS max FROM internship_steps WHERE section_id = $1",
+        [sectionId]
       );
       const nextIndex = Number(maxRes.rows[0].max || 0) + 1;
 
       await pool.query(
         `
-          INSERT INTO internship_steps (part_id, title, step_type, order_index, planned_duration_min)
-          VALUES ($1, $2, $3, $4, $5)
-        `,
-        [partId, title, type, nextIndex, durationMin || null]
+    INSERT INTO internship_steps (part_id, section_id, title, step_type, order_index, planned_duration_min)
+    VALUES ($1, $2, $3, $4, $5, $6)
+  `,
+        [partId, sectionId, title, type, nextIndex, durationMin || null]
       );
 
       configStates.delete(ctx.from.id);
 
       await ctx.reply("Этап добавлен.");
-      await showInternshipPart(ctx, partId);
+      await showInternshipSectionSteps(ctx, sectionId, partId);
     } catch (err) {
       logError("internship_new_step_type_x", err);
     }
@@ -3538,7 +4041,7 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
       const state = mediaStates.get(ctx.from.id);
       if (!state) return next();
 
-      const { sessionId, stepId, type, partId, userId } = state;
+      const { sessionId, sectionId, stepId, type, userId } = state;
 
       let fileId = null;
       if (type === "video" && ctx.message.video) {
@@ -3558,7 +4061,9 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
       mediaStates.delete(ctx.from.id);
 
       await ctx.reply("Этап отмечен как выполненный ✅.");
-      await showSessionPart(ctx, sessionId, partId, userId);
+      await showSessionSection(ctx, sessionId, sectionId, userId, {
+        edit: false,
+      });
     } catch (err) {
       logError("internship_media_handler_x", err);
       return next();
@@ -3574,14 +4079,13 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
 
       const res = await pool.query(
         `
-        SELECT s.*, u.full_name AS intern_name
-        FROM internship_sessions s
-        JOIN users u ON u.id = s.user_id
-        WHERE s.started_by = $1
-          AND s.finished_at IS NULL
-          AND s.is_canceled = FALSE
-        ORDER BY s.started_at DESC
-        LIMIT 1
+      SELECT s.*
+      FROM internship_sessions s
+      WHERE s.started_by = $1
+        AND s.finished_at IS NULL
+        AND s.is_canceled = FALSE
+      ORDER BY s.started_at DESC
+      LIMIT 1
       `,
         [admin.id]
       );
@@ -3594,36 +4098,10 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
 
       const session = res.rows[0];
 
-      const text =
-        `🧑‍🏫 Активная стажировка\n\n` +
-        `Стажёр: ${session.intern_name || "Без имени"}\n` +
-        `День: ${session.day_number}\n` +
-        `Начата: ${session.started_at.toLocaleString("ru-RU", {
-          day: "2-digit",
-          month: "2-digit",
-          hour: "2-digit",
-          minute: "2-digit",
-        })}`;
-
-      const keyboard = Markup.inlineKeyboard([
-        [
-          Markup.button.callback(
-            "⏹ Закончить стажировку",
-            `admin_internship_finish_${session.id}_${session.user_id}`
-          ),
-        ],
-        [
-          Markup.button.callback(
-            "❌ Отменить стажировку",
-            `admin_internship_cancel_${session.id}_${session.user_id}`
-          ),
-        ],
-        [Markup.button.callback("🔙 В меню", "back_main")],
-      ]);
-
-      await deliver(ctx, { text, extra: keyboard }, { edit: true });
+      // ✅ сразу открываем “экран пользователя” (как твой скрин 3)
+      await showUserInternshipMenu(ctx, admin, session.user_id);
     } catch (err) {
-      logError("internship_active_menu_x", err);
+      logError("internship_active_menu", err);
     }
   });
 }
