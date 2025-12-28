@@ -816,18 +816,96 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
       const me = await ensureUser(ctx);
       if (!me || !isAdmin(me)) return;
 
-      finishSessionStates.set(ctx.from.id, {
-        mode: "issues",
-        sessionId,
-        userId,
-      });
+      const keyboard = Markup.inlineKeyboard([
+        [
+          Markup.button.callback(
+            "✅ Да, завершить",
+            `admin_internship_finish_confirm_${sessionId}_${userId}`
+          ),
+        ],
+        [Markup.button.callback("❌ Нет", `admin_user_internship_${userId}`)],
+      ]);
 
-      await ctx.reply(
-        "Опишите замечания по стажировке одним сообщением.\n" +
-          "Если замечаний нет — отправьте «-»."
+      await deliver(
+        ctx,
+        {
+          text: "Точно завершить стажировку? Время окончания будет зафиксировано.",
+          extra: keyboard,
+        },
+        { edit: true }
       );
     } catch (err) {
       logError("admin_internship_finish", err);
+    }
+  });
+
+  bot.action(/^admin_internship_finish_confirm_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const sessionId = parseInt(ctx.match[1], 10);
+      const userId = parseInt(ctx.match[2], 10);
+
+      const me = await ensureUser(ctx);
+      if (!me || !isAdmin(me)) return;
+
+      // берём day_number (нужно, чтобы обновить intern_days_completed)
+      const sRes = await pool.query(
+        `
+          SELECT id, day_number
+          FROM internship_sessions
+          WHERE id = $1 AND user_id = $2
+          LIMIT 1
+          `,
+        [sessionId, userId]
+      );
+
+      if (!sRes.rows.length) {
+        await ctx
+          .answerCbQuery("Сессия не найдена", { show_alert: false })
+          .catch(() => {});
+        return;
+      }
+
+      const dayNumber = Number(sRes.rows[0].day_number || 0);
+
+      // фиксируем завершение (только если ещё не завершена)
+      await pool.query(
+        `
+          UPDATE internship_sessions
+          SET finished_at = NOW()
+          WHERE id = $1
+            AND user_id = $2
+            AND finished_at IS NULL
+            AND is_canceled = FALSE
+          `,
+        [sessionId, userId]
+      );
+
+      // обновим прогресс по дням (важно для корректного nextDay при следующем старте)
+      if (dayNumber > 0) {
+        await pool.query(
+          `
+            UPDATE users
+            SET intern_days_completed = GREATEST(COALESCE(intern_days_completed,0), $2)
+            WHERE id = $1
+            `,
+          [userId, dayNumber]
+        );
+      }
+
+      await ctx
+        .answerCbQuery("Стажировка успешно завершена", { show_alert: false })
+        .catch(() => {});
+
+      // уводим в главное меню академии
+      await showMainMenu(ctx, me);
+    } catch (err) {
+      logError("admin_internship_finish_confirm", err);
+      await ctx
+        .answerCbQuery("Не удалось завершить стажировку. Попробуйте ещё раз.", {
+          show_alert: false,
+        })
+        .catch(() => {});
     }
   });
 
