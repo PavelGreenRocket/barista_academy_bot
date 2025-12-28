@@ -8,6 +8,7 @@ const {
   configStates,
   mediaStates,
   finishSessionStates,
+  internshipCommentStates,
   isAdmin,
   isTelegraphUrl,
 } = require("./state");
@@ -181,6 +182,88 @@ async function showUserInternshipHistoryDay(ctx, admin, userId, sessionId) {
     { text, extra: Markup.inlineKeyboard(buttons) },
     { edit: true }
   );
+}
+
+async function showInternshipCommentScreen(
+  ctx,
+  admin,
+  userId,
+  sessionId,
+  opts = {}
+) {
+  const uRes = await pool.query(
+    "SELECT id, full_name FROM users WHERE id = $1",
+    [userId]
+  );
+  if (!uRes.rows.length) return ctx.reply("Пользователь не найден.");
+  const user = uRes.rows[0];
+
+  const sRes = await pool.query(
+    `
+    SELECT s.id, s.day_number, s.trade_point_id, tp.title AS trade_point_title
+    FROM internship_sessions s
+    LEFT JOIN trade_points tp ON tp.id = s.trade_point_id
+    WHERE s.id = $1 AND s.user_id = $2
+    LIMIT 1
+    `,
+    [sessionId, userId]
+  );
+  if (!sRes.rows.length) return ctx.reply("День стажировки не найден.");
+  const session = sRes.rows[0];
+
+  const cRes = await pool.query(
+    `
+    SELECT c.id, c.comment, c.created_at, u.full_name AS author_name
+    FROM internship_session_comments c
+    LEFT JOIN users u ON u.id = c.author_id
+    WHERE c.session_id = $1
+    ORDER BY c.id ASC
+    `,
+    [sessionId]
+  );
+  const comments = cRes.rows;
+
+  const tpTitle = session.trade_point_title || "не указано";
+
+  let text =
+    `📝 Комментарий по стажировке (день ${session.day_number})\n\n` +
+    `Стажёр: ${user.full_name || "Без имени"}\n` +
+    `Место стажировки: ${tpTitle}\n\n` +
+    `Добавленные комментарии:\n`;
+
+  if (!comments.length) {
+    text += "— пока нет\n";
+  } else {
+    for (const c of comments) {
+      const dt = c.created_at
+        ? new Date(c.created_at).toLocaleString("ru-RU", {
+            day: "2-digit",
+            month: "2-digit",
+            hour: "2-digit",
+            minute: "2-digit",
+          })
+        : "";
+      const author = c.author_name || "без автора";
+      text += `• ${dt} — ${author}: ${c.comment}\n`;
+    }
+  }
+
+  const kb = Markup.inlineKeyboard([
+    [
+      Markup.button.callback(
+        "➕ Добавить комментарий",
+        `admin_internship_comment_add_${sessionId}_${userId}`
+      ),
+    ],
+    [
+      Markup.button.callback(
+        "🔙 К стажировке",
+        `admin_user_internship_${userId}`
+      ),
+    ],
+  ]);
+
+  await deliver(ctx, { text, extra: kb }, { edit: Boolean(opts.edit) });
 }
 
 /**
@@ -522,7 +605,7 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
       const insRes = await pool.query(
         `
         INSERT INTO internship_sessions(user_id, day_number, started_at, started_by, trade_point_id, was_late, is_canceled)
-        VALUES ($1,$2,NOW(),$3,$4,FALSE,FALSE)
+        VALUES ($1,$2,NOW(),$3,$4,TRUE,FALSE)
         RETURNING id
       `,
         [userId, nextDay, me.id, tpId]
@@ -581,6 +664,55 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
       await showUserInternshipMenu(ctx, me, userId);
     } catch (err) {
       logError("admin_user_internship", err);
+    }
+  });
+
+  bot.action(/^admin_internship_comment_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const sessionId = parseInt(ctx.match[1], 10);
+      const userId = parseInt(ctx.match[2], 10);
+
+      const me = await ensureUser(ctx);
+      if (!me || !isAdmin(me)) return;
+
+      await showInternshipCommentScreen(ctx, me, userId, sessionId, {
+        edit: true,
+      });
+    } catch (err) {
+      logError("admin_internship_comment", err);
+    }
+  });
+
+  bot.action(/^admin_internship_comment_add_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const sessionId = parseInt(ctx.match[1], 10);
+      const userId = parseInt(ctx.match[2], 10);
+
+      const me = await ensureUser(ctx);
+      if (!me || !isAdmin(me)) return;
+
+      internshipCommentStates.set(ctx.from.id, { sessionId, userId });
+
+      const kb = Markup.inlineKeyboard([
+        [
+          Markup.button.callback(
+            "🔙 Назад",
+            `admin_internship_comment_${sessionId}_${userId}`
+          ),
+        ],
+        [
+          Markup.button.callback(
+            "❌ Отмена",
+            `admin_user_internship_${userId}`
+          ),
+        ],
+      ]);
+
+      await ctx.reply("Введите комментарий одним сообщением:", kb);
+    } catch (err) {
+      logError("admin_internship_comment_add", err);
     }
   });
 
@@ -1001,6 +1133,46 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
   // ==========================
 
   bot.on("text", async (ctx, next) => {
+    const commentState = internshipCommentStates.get(ctx.from.id);
+    if (commentState) {
+      try {
+        const me = await ensureUser(ctx);
+        if (!me || !isAdmin(me)) {
+          internshipCommentStates.delete(ctx.from.id);
+          return;
+        }
+
+        const txt = String(ctx.message.text || "").trim();
+        if (!txt) return;
+
+        await pool.query(
+          `
+      INSERT INTO internship_session_comments(session_id, author_id, comment, created_at)
+      VALUES ($1, $2, $3, NOW())
+      `,
+          [commentState.sessionId, me.id, txt]
+        );
+
+        internshipCommentStates.delete(ctx.from.id);
+
+        // после сохранения показываем экран комментариев (как в ЛК)
+        await showInternshipCommentScreen(
+          ctx,
+          me,
+          commentState.userId,
+          commentState.sessionId,
+          { edit: false }
+        );
+      } catch (err) {
+        internshipCommentStates.delete(ctx.from.id);
+        logError("internship_comment_text", err);
+        await ctx.reply(
+          "⚠️ Не удалось сохранить комментарий. Попробуйте ещё раз."
+        );
+      }
+      return;
+    }
+
     try {
       const me = await ensureUser(ctx);
       if (!me) return next && next();
@@ -1316,15 +1488,15 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
 
       await pool.query(
         `
-        INSERT INTO internship_step_results(session_id, step_id, is_passed, checked_at, checked_by, file_id)
-        VALUES ($1,$2,TRUE,NOW(),$3,$4)
-        ON CONFLICT (session_id, step_id)
-        DO UPDATE SET
-          is_passed=TRUE,
-          checked_at=NOW(),
-          checked_by=$3,
-          file_id=$4
-      `,
+  INSERT INTO internship_step_results(session_id, step_id, is_passed, checked_at, checked_by, media_file_id)
+  VALUES ($1,$2,TRUE,NOW(),$3,$4)
+  ON CONFLICT (session_id, step_id)
+  DO UPDATE SET
+    is_passed=TRUE,
+    checked_at=NOW(),
+    checked_by=$3,
+    media_file_id=$4
+`,
         [sessionId, stepId, me.id, fileId]
       );
 

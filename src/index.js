@@ -1,6 +1,7 @@
 // src/index.js
 
 require("dotenv").config();
+
 const { Telegraf, Markup } = require("telegraf");
 const pool = require("./db/pool");
 
@@ -9,26 +10,42 @@ const registerAdminCardCommands = require("./bot/adminCards");
 const registerTheory = require("./bot/theory");
 const registerTrain = require("./bot/train");
 const registerAttest = require("./bot/attest");
-const registerAdminUsers = require("./bot/adminUsers");
-const registerInstructions = require("./bot/instructions");
-const { registerAssistant } = require("./bot/assistant");
 const {
   registerInternship,
   hasActiveInternshipSessionForTrainer,
 } = require("./bot/internship/index");
-const { registerInterviewModule } = require("./bot/interviews");
 
 const { deliver } = require("./utils/renderHelpers");
 const { startOutboxWorker } = require("./outbox/worker");
 
+// -------------------
+// Диагностика ENV
+// -------------------
 const BOT_TOKEN = process.env.BOT_TOKEN;
+
+// безопасный лог токена (не печатаем полностью)
+console.log("🔎 ENV BOT_TOKEN exists:", !!process.env.BOT_TOKEN);
+console.log(
+  "🔎 BOT_TOKEN length:",
+  process.env.BOT_TOKEN ? process.env.BOT_TOKEN.length : "null"
+);
+console.log(
+  "🔎 BOT_TOKEN preview:",
+  process.env.BOT_TOKEN
+    ? `${process.env.BOT_TOKEN.slice(0, 6)}...${process.env.BOT_TOKEN.slice(
+        -4
+      )}`
+    : "null"
+);
 
 if (!BOT_TOKEN) {
   console.error("❌ BOT_TOKEN не найден в .env");
   process.exit(1);
 }
 
+console.log("🤖 Creating Telegraf instance...");
 const bot = new Telegraf(BOT_TOKEN);
+console.log("🤖 Telegraf instance created");
 
 // ----- Вспомогательные вещи -----
 
@@ -69,9 +86,6 @@ async function showMainMenu(ctx) {
   // основные разделы
   keyboard.push([Markup.button.callback("📚 Теория", "user_theory")]);
   keyboard.push([Markup.button.callback("🎯 Тренировки", "user_train")]);
-  keyboard.push([
-    Markup.button.callback("❓ Вопрос по обучению", "user_ask_question"),
-  ]);
   keyboard.push([Markup.button.callback("✅ Аттестация", "user_attest")]);
 
   // 👉 кнопка процесса стажировки, если у админа есть активная сессия
@@ -88,8 +102,9 @@ async function showMainMenu(ctx) {
   }
 
   // 👉 НОВОЕ: кнопка "Запланировано собеседование", если у админа есть активные кандидаты
+  // (оставляю как у тебя — сейчас запрос никуда не выводится, но и не ломает)
   if (isAdmin) {
-    const candRes = await pool.query(
+    await pool.query(
       `
       SELECT 1
       FROM candidates
@@ -99,15 +114,6 @@ async function showMainMenu(ctx) {
       `,
       [user.id]
     );
-
-    if (candRes.rows.length > 0) {
-      keyboard.push([
-        Markup.button.callback(
-          "❗ 🧑‍💻 Запланировано собеседование",
-          "admin_interviews"
-        ),
-      ]);
-    }
   }
 
   // переход в админ-панель
@@ -128,11 +134,7 @@ registerAdminCardCommands(bot, ensureUser, logError);
 registerTheory(bot, ensureUser, logError);
 registerTrain(bot, ensureUser, logError);
 registerAttest(bot, ensureUser, logError);
-registerAdminUsers(bot, ensureUser, logError);
-registerInstructions(bot, ensureUser, logError);
-registerAssistant(bot, ensureUser, logError);
 registerInternship(bot, ensureUser, logError, showMainMenu);
-registerInterviewModule(bot, ensureUser, logError, showMainMenu);
 
 startOutboxWorker(bot);
 
@@ -167,17 +169,45 @@ bot.catch((err, ctx) => {
   }
 });
 
-// ----- Запуск бота -----
+// ----- Запуск бота (с диагностикой) -----
 
-bot
-  .launch()
-  .then(() => {
+(async () => {
+  try {
+    console.log("🚀 Preflight: calling getMe() to validate token...");
+    const me = await bot.telegram.getMe();
+    console.log("✅ getMe OK:", {
+      id: me.id,
+      username: me.username,
+      first_name: me.first_name,
+      is_bot: me.is_bot,
+    });
+
+    console.log("🚀 Launching bot (polling/getUpdates)...");
+    await bot.launch();
     console.log("✅ Bot started: barista_academy_bot");
-  })
-  .catch((err) => {
-    logError("bot.launch", err);
+  } catch (err) {
+    console.error("❌ BOT LAUNCH FAILED");
+    console.error("Message:", err?.message);
+    console.error("Code:", err?.code);
+    console.error("Response:", err?.response);
+    console.error("On:", err?.on);
+
+    // подсказки по частым кейсам
+    const desc = err?.response?.description || "";
+    if (err?.response?.error_code === 401 || /Unauthorized/i.test(desc)) {
+      console.error(
+        "💡 Похоже на неверный BOT_TOKEN. Проверь .env (без пробелов/кавычек/переносов) и что BOT_TOKEN именно тот."
+      );
+    }
+    if (err?.response?.error_code === 409 || /Conflict/i.test(desc)) {
+      console.error(
+        "💡 409 Conflict: запущен второй инстанс бота с тем же токеном (или активен webhook). Останови второй процесс или сделай deleteWebhook."
+      );
+    }
+
     process.exit(1);
-  });
+  }
+})();
 
 process.once("SIGINT", () => {
   console.log("👋 SIGINT получен, останавливаем бота...");

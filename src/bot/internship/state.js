@@ -15,6 +15,9 @@ const mediaStates = new Map(); // key: adminTelegramId → { sessionId, sectionI
 // состояние для завершения стажировки (замечания и комментарий)
 const finishSessionStates = new Map(); // key: adminTelegramId → { mode, sessionId, userId, issuesText? }
 
+// состояние для комментариев по стажировке (как в ЛК)
+const internshipCommentStates = new Map(); // key: adminTelegramId → { sessionId, userId }
+
 function isAdmin(user) {
   return user && user.role === "admin";
 }
@@ -30,6 +33,7 @@ module.exports = {
   configStates,
   mediaStates,
   finishSessionStates,
+  internshipCommentStates,
   isAdmin,
   isTelegraphUrl,
 };

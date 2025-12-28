@@ -44,13 +44,18 @@ async function showUserInternshipMenu(ctx, admin, targetUserId) {
 
   const activeSession = await getActiveSessionForUser(user.id);
 
-  const isIntern = user.staff_status === "intern";
+  // В академии ориентируемся на ЛК: если есть активная сессия — значит сейчас статус "стажёр"
+  const isInternByStatus = user.staff_status === "intern";
+  const isIntern = Boolean(activeSession) || isInternByStatus;
+
   const nextDay = (user.intern_days_completed || 0) + 1;
+  const dayNumber = activeSession?.day_number || (isIntern ? nextDay : null);
 
   let text =
     `👤 ${name}\n` +
     `Роль: ${user.role}\n` +
-    (isIntern ? `Статус: стажёр\n\n` : `Статус: работник\n\n`);
+    `Статус: ${isIntern ? "стажёр" : "работник"}\n` +
+    (dayNumber ? `День стажировки: ${dayNumber}\n\n` : `\n`);
 
   const buttons = [];
 
@@ -110,6 +115,12 @@ async function showUserInternshipMenu(ctx, admin, targetUserId) {
         ),
       ]);
     }
+    buttons.push([
+      Markup.button.callback(
+        "📝 комментарий по стажировке",
+        `admin_internship_comment_${activeSession.id}_${user.id}`
+      ),
+    ]);
 
     buttons.push([
       Markup.button.callback(
@@ -394,7 +405,7 @@ async function showSessionSection(
 
   const secRes = await pool.query(
     `
-    SELECT s.id, s.title, s.order_index, s.telegraph_url, s.part_id,
+    SELECT s.id, s.title, s.order_index, s.telegraph_url, s.part_id, s.duration_days,
            p.title AS part_title
     FROM internship_sections s
     JOIN internship_parts p ON p.id = s.part_id
@@ -430,7 +441,8 @@ async function showSessionSection(
   let text =
     `🎓 Стажировка — день ${session.day_number}\n` +
     `Часть: ${sec.part_title}\n` +
-    `Раздел ${currentPos}/${totalSecs}\n\n`;
+    `Раздел ${currentPos}/${totalSecs}\n` +
+    `Изучение в день: ${sec.duration_days ?? "не указан"}\n\n`;
 
   // короткая инструкция
   text += `Ниже (кнопки) этапы — нажми, чтобы отметить выполнение.\n`;
