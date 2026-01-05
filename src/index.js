@@ -142,6 +142,103 @@ startOutboxWorker(bot);
 
 bot.start(async (ctx) => {
   try {
+    const payload = (ctx.startPayload || "").trim();
+
+    // deep-link из ЛК: media_{candId}_{stepId}
+    const m = payload.match(/^media_(\d+)_(\d+)$/);
+    if (m) {
+      const candId = Number(m[1]);
+      const stepId = Number(m[2]);
+
+      // 1) user_id стажёра по кандидату
+      const uRes = await pool.query(
+        `
+        SELECT c.name AS cand_name, u.id AS user_id
+        FROM candidates c
+        LEFT JOIN users u ON u.candidate_id = c.id
+        WHERE c.id = $1
+        LIMIT 1
+        `,
+        [candId]
+      );
+
+      const userId = uRes.rows[0]?.user_id;
+      const candName = uRes.rows[0]?.cand_name || "стажёр";
+
+      if (!userId) {
+        await ctx.reply("Пользователь не привязан к кандидату.");
+        return;
+      }
+
+      // 2) шаг + тип
+      const stRes = await pool.query(
+        `SELECT id, title, step_type FROM internship_steps WHERE id = $1 LIMIT 1`,
+        [stepId]
+      );
+      const step = stRes.rows[0];
+      if (!step) {
+        await ctx.reply("Этап не найден.");
+        return;
+      }
+
+      // 3) берём последнее passed=true с медиа
+      const rRes = await pool.query(
+        `
+        SELECT r.media_file_id, r.checked_at, u.full_name AS checker_name
+        FROM internship_step_results r
+        JOIN internship_sessions s ON s.id = r.session_id
+        LEFT JOIN users u ON u.id = r.checked_by
+        WHERE s.user_id = $1
+          AND s.is_canceled = FALSE
+          AND r.step_id = $2
+          AND r.is_passed = TRUE
+          AND r.media_file_id IS NOT NULL
+        ORDER BY r.checked_at DESC
+        LIMIT 1
+        `,
+        [userId, stepId]
+      );
+
+      const row = rRes.rows[0];
+      if (!row?.media_file_id) {
+        await ctx.reply("У этого этапа нет прикреплённого медиа.");
+        return;
+      }
+
+      const lkUser = process.env.LK_BOT_USERNAME || "green_rocket_lk_bot";
+      const backUrl = `https://t.me/${lkUser}`;
+
+      const caption =
+        `📎 Медиа по этапу\n\n` +
+        `Стажёр: ${candName}\n` +
+        `Этап: ${step.title}\n` +
+        (row.checker_name ? `Отметил: ${row.checker_name}\n` : "");
+
+      const kb = Markup.inlineKeyboard([
+        [Markup.button.url("⬅️ Вернуться в ЛК", backUrl)],
+      ]);
+
+      if (step.step_type === "photo") {
+        await ctx
+          .replyWithPhoto(row.media_file_id, { caption, ...kb })
+          .catch(async () => {
+            await ctx.reply("Не удалось отправить фото.").catch(() => {});
+          });
+      } else if (step.step_type === "video") {
+        await ctx
+          .replyWithVideo(row.media_file_id, { caption, ...kb })
+          .catch(async () => {
+            await ctx.reply("Не удалось отправить видео.").catch(() => {});
+          });
+      } else {
+        // если вдруг simple — просто сообщаем
+        await ctx.reply("Этот этап не является фото/видео этапом.", kb);
+      }
+
+      return;
+    }
+
+    // обычный старт
     await showMainMenu(ctx);
   } catch (err) {
     logError("/start", err);

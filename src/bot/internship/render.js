@@ -90,7 +90,10 @@ async function showUserInternshipMenu(ctx, admin, targetUserId) {
       "Нажмите на часть, чтобы начать/продолжить обучение.\n\n";
 
     const parts = await getPartsWithSteps();
-    const stepMap = await getSessionStepMap(activeSession.id);
+
+    // ✅ прогресс должен быть накопительным: считаем по пользователю (overall),
+    // чтобы на новой стажировке не было “с нуля”.
+    const stepMap = await getUserOverallStepMap(user.id);
 
     for (const part of parts) {
       if (!part.steps.length) continue;
@@ -327,7 +330,8 @@ async function showSessionPartSections(
   const sections = secRes.rows;
   const sectionIds = sections.map((s) => s.id);
 
-  const stepMap = await getSessionStepMap(sessionId);
+  // ✅ накопительный прогресс по пользователю (не сбрасывается на новой сессии)
+  const stepMap = await getUserOverallStepMap(userId);
 
   const stRes = sectionIds.length
     ? await pool.query(
@@ -436,7 +440,9 @@ async function showSessionSection(
   );
   const steps = stepRes.rows;
 
-  const stepMap = await getSessionStepMap(sessionId);
+  // ✅ накопительный прогресс: если шаг уже был выполнен в любой прошлой стажировке,
+  // он должен оставаться ✅ и в новой.
+  const stepMap = await getUserOverallStepMap(userId);
 
   let text =
     `🎓 Стажировка — день ${session.day_number}\n` +
@@ -445,7 +451,7 @@ async function showSessionSection(
     `Изучение в день: ${sec.duration_days ?? "не указан"}\n\n`;
 
   // короткая инструкция
-  text += `Ниже (кнопки) этапы — нажми, чтобы отметить выполнение.\n`;
+  text += `Ниже (кнопки) этапы этого раздела— нажми, чтобы отметить выполнение.\n`;
 
   const buttons = [];
 

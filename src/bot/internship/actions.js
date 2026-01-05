@@ -655,6 +655,31 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
         [userId, sessionId, tpId, me.id]
       );
 
+      // 📤 OUTBOX: сообщить наставнику в академии, что стажировка началась (кнопка "открыть курс")
+      try {
+        const uRes = await pool.query(
+          `SELECT full_name FROM users WHERE id = $1 LIMIT 1`,
+          [userId]
+        );
+        const internName = uRes.rows[0]?.full_name || "стажёр";
+
+        await pool.query(
+          `
+    INSERT INTO outbox_events (destination, event_type, payload)
+    VALUES ('academy', 'internship_started', $1::jsonb)
+    `,
+          [
+            JSON.stringify({
+              mentor_telegram_id: ctx.from?.id, // наставник = тот, кто нажал "начать" в академии
+              intern_user_id: userId,
+              intern_name: internName,
+            }),
+          ]
+        );
+      } catch (e) {
+        console.error("[internship_started outbox] error:", e);
+      }
+
       await showUserInternshipMenu(ctx, me, userId);
     } catch (err) {
       logError("admin_internship_start_late_yes", err);
@@ -678,9 +703,10 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
 
       const insRes = await pool.query(
         `
-        INSERT INTO internship_sessions(user_id, day_number, started_at, started_by, trade_point_id, was_late, is_canceled)
-        VALUES ($1,$2,NOW(),$3,$4,TRUE,FALSE)
+               INSERT INTO internship_sessions(user_id, day_number, started_at, started_by, trade_point_id, was_late, is_canceled)
+        VALUES ($1,$2,NOW(),$3,$4,FALSE,FALSE)
         RETURNING id
+
       `,
         [userId, nextDay, me.id, tpId]
       );
@@ -728,6 +754,31 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
         `,
         [userId, sessionId, tpId, me.id]
       );
+
+      // 📤 OUTBOX: сообщить наставнику в академии, что стажировка началась (кнопка "открыть курс")
+      try {
+        const uRes = await pool.query(
+          `SELECT full_name FROM users WHERE id = $1 LIMIT 1`,
+          [userId]
+        );
+        const internName = uRes.rows[0]?.full_name || "стажёр";
+
+        await pool.query(
+          `
+    INSERT INTO outbox_events (destination, event_type, payload)
+    VALUES ('academy', 'internship_started', $1::jsonb)
+    `,
+          [
+            JSON.stringify({
+              mentor_telegram_id: ctx.from?.id, // наставник = тот, кто нажал "начать" в академии
+              intern_user_id: userId,
+              intern_name: internName,
+            }),
+          ]
+        );
+      } catch (e) {
+        console.error("[internship_started outbox] error:", e);
+      }
 
       await showUserInternshipMenu(ctx, me, userId);
     } catch (err) {
@@ -999,12 +1050,62 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
         );
       }
 
+      // 📤 OUTBOX (LK): уведомление наставнику, что стажировка завершена + кнопка открыть карточку
+      try {
+        const infoRes = await pool.query(
+          `
+    SELECT u.candidate_id, u.full_name
+    FROM users u
+    WHERE u.id = $1
+    LIMIT 1
+    `,
+          [userId]
+        );
+
+        const candidateId = Number(infoRes.rows[0]?.candidate_id) || null;
+        const internName = infoRes.rows[0]?.full_name || "стажёр";
+
+        if (candidateId) {
+          await pool.query(
+            `
+      INSERT INTO outbox_events (destination, event_type, payload)
+      VALUES ('lk', 'internship_finished', $1::jsonb)
+      `,
+            [
+              JSON.stringify({
+                mentor_telegram_id: ctx.from?.id, // кто завершил — тому и уведомление в ЛК (как “ответственный”)
+                candidate_id: candidateId,
+                intern_name: internName,
+                intern_user_id: userId,
+                session_id: sessionId,
+              }),
+            ]
+          );
+        }
+      } catch (e) {
+        console.error("[internship_finished outbox] error:", e);
+      }
+
       await ctx
         .answerCbQuery("Стажировка успешно завершена", { show_alert: false })
         .catch(() => {});
 
       // уводим в главное меню академии
       await showMainMenu(ctx, me);
+
+      // 🔗 после завершения — сразу подсказка вернуться в ЛК
+      await ctx.reply("Вернуться в ЛК:", {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "🤖 открыть ЛК-бот",
+                url: "https://t.me/green_rocket_lk_bot",
+              },
+            ],
+          ],
+        },
+      });
     } catch (err) {
       logError("admin_internship_finish_confirm", err);
       await ctx
@@ -1511,10 +1612,12 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
       // ЭТАП: новый
       if (state.mode === "new_step") {
         const nextIdx = await getNextStepOrderIndex(state.sectionId);
+
         await pool.query(
-          "INSERT INTO internship_steps(section_id, title, step_type, order_index) VALUES ($1,$2,'simple',$3)",
-          [state.sectionId, text, nextIdx]
+          "INSERT INTO internship_steps(part_id, section_id, title, step_type, order_index) VALUES ($1,$2,$3,'simple',$4)",
+          [state.partId, state.sectionId, text, nextIdx]
         );
+
         configStates.delete(ctx.from.id);
         await showInternshipSectionSteps(ctx, state.sectionId, state.partId);
         return;

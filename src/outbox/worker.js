@@ -38,31 +38,41 @@ async function processOutboxOnce(bot) {
     // выполняем доставку вне транзакции
     for (const row of res.rows) {
       try {
-        if (row.event_type === "internship_started") {
-          const p = row.payload || {};
-          const mentorTg = Number(p.mentor_telegram_id);
-          const internUserId = Number(p.intern_user_id);
-          const internName = p.intern_name || "стажёр";
+        // Строго: неизвестные типы событий — это ошибка (иначе они “тихо” станут done)
+        if (row.event_type !== "internship_started") {
+          throw new Error(`Unhandled outbox event_type: ${row.event_type}`);
+        }
 
-          if (mentorTg && internUserId) {
-            const text =
-              `🚀 Обучение началось\n\n` +
-              `Стажёр: ${internName}\n` +
-              `Нажмите кнопку ниже, чтобы открыть курс.`;
+        const p = row.payload || {};
+        const mentorTg = Number(p.mentor_telegram_id);
+        const internUserId = Number(p.intern_user_id);
+        const internName = p.intern_name || "стажёр";
 
-            await bot.telegram.sendMessage(mentorTg, text, {
-              reply_markup: {
-                inline_keyboard: [
-                  [
-                    {
-                      text: "📖 открыть курс",
-                      callback_data: `admin_user_internship_${internUserId}`,
-                    },
-                  ],
-                ],
-              },
-            });
-          }
+        // Строго: если payload неполный — это ошибка (иначе будет done без отправки)
+        if (!mentorTg) throw new Error("Missing payload.mentor_telegram_id");
+        if (!internUserId) throw new Error("Missing payload.intern_user_id");
+
+        const text =
+          `🚀 Обучение началось\n\n` +
+          `Стажёр: ${internName}\n` +
+          `Нажмите кнопку ниже, чтобы открыть курс.`;
+
+        const sent = await bot.telegram.sendMessage(mentorTg, text, {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                {
+                  text: "📖 открыть курс",
+                  callback_data: `admin_user_internship_${internUserId}`,
+                },
+              ],
+            ],
+          },
+        });
+
+        // Если Telegram по какой-то причине вернул пустой ответ — тоже считаем ошибкой
+        if (!sent || !sent.message_id) {
+          throw new Error("sendMessage returned empty response");
         }
 
         await pool.query(

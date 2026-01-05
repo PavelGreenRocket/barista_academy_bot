@@ -72,43 +72,6 @@ async function showTopics(ctx) {
   );
 }
 
-async function showTradePoints(ctx) {
-  const res = await pool.query(
-    `
-    SELECT id, title
-    FROM trade_points
-    WHERE is_active = TRUE
-    ORDER BY id
-    `
-  );
-
-  let text = "🏬 Торговые точки:\n\n";
-  const buttons = [];
-
-  if (!res.rows.length) {
-    text +=
-      "Пока нет ни одной торговой точки.\n\n" +
-      "Нажми «➕ Добавить торговую точку», чтобы создать первую.";
-  } else {
-    for (const row of res.rows) {
-      text += `• ${row.title}\n`;
-    }
-  }
-
-  buttons.push([
-    Markup.button.callback(
-      "➕ Добавить торговую точку",
-      "admin_trade_point_new"
-    ),
-  ]);
-  buttons.push([Markup.button.callback("🔙 К настройкам", "admin_settings")]);
-
-  await deliver(
-    ctx,
-    { text, extra: Markup.inlineKeyboard(buttons) },
-    { edit: true }
-  );
-}
 
 async function showTopicBlocks(ctx, topicId) {
   const topicRes = await pool.query(
@@ -331,7 +294,6 @@ function registerAdminCommands(bot, ensureUser, logError) {
             "admin_internship_menu"
           ),
         ],
-        [Markup.button.callback("🔧 Торговые точки", "admin_trade_points")],
         [Markup.button.callback("⬅️ Назад", "admin_menu")],
       ]);
 
