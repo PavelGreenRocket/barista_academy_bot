@@ -612,6 +612,49 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
       );
       const sessionId = insRes.rows[0].id;
 
+      // синхронизируем schedules: planned -> started + session_id
+      await pool.query(
+        `
+        WITH cand AS (
+          SELECT candidate_id FROM users WHERE id = $1
+        ),
+        moved AS (
+          UPDATE internship_schedules
+             SET status = 'started',
+                 session_id = $2,
+                 started_at = NOW(),
+                 user_id = COALESCE(user_id, $1),
+                 trade_point_id = COALESCE(trade_point_id, $3),
+                 mentor_user_id = COALESCE(mentor_user_id, $4)
+           WHERE candidate_id = (SELECT candidate_id FROM cand)
+             AND status = 'planned'
+           RETURNING id
+        )
+        INSERT INTO internship_schedules (
+          candidate_id, user_id, trade_point_id, mentor_user_id,
+          planned_date, planned_time_from, planned_time_to,
+          status, session_id, started_at
+        )
+        SELECT
+          u.candidate_id,
+          $1,
+          $3,
+          $4,
+          c.internship_date,
+          c.internship_time_from,
+          c.internship_time_to,
+          'started',
+          $2,
+          NOW()
+        FROM users u
+        JOIN candidates c ON c.id = u.candidate_id
+        WHERE u.id = $1
+          AND u.candidate_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM moved)
+        `,
+        [userId, sessionId, tpId, me.id]
+      );
+
       await showUserInternshipMenu(ctx, me, userId);
     } catch (err) {
       logError("admin_internship_start_late_yes", err);
@@ -642,6 +685,49 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
         [userId, nextDay, me.id, tpId]
       );
       const sessionId = insRes.rows[0].id;
+
+      // синхронизируем schedules: planned -> started + session_id
+      await pool.query(
+        `
+        WITH cand AS (
+          SELECT candidate_id FROM users WHERE id = $1
+        ),
+        moved AS (
+          UPDATE internship_schedules
+             SET status = 'started',
+                 session_id = $2,
+                 started_at = NOW(),
+                 user_id = COALESCE(user_id, $1),
+                 trade_point_id = COALESCE(trade_point_id, $3),
+                 mentor_user_id = COALESCE(mentor_user_id, $4)
+           WHERE candidate_id = (SELECT candidate_id FROM cand)
+             AND status = 'planned'
+           RETURNING id
+        )
+        INSERT INTO internship_schedules (
+          candidate_id, user_id, trade_point_id, mentor_user_id,
+          planned_date, planned_time_from, planned_time_to,
+          status, session_id, started_at
+        )
+        SELECT
+          u.candidate_id,
+          $1,
+          $3,
+          $4,
+          c.internship_date,
+          c.internship_time_from,
+          c.internship_time_to,
+          'started',
+          $2,
+          NOW()
+        FROM users u
+        JOIN candidates c ON c.id = u.candidate_id
+        WHERE u.id = $1
+          AND u.candidate_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM moved)
+        `,
+        [userId, sessionId, tpId, me.id]
+      );
 
       await showUserInternshipMenu(ctx, me, userId);
     } catch (err) {
@@ -878,6 +964,26 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
             AND finished_at IS NULL
             AND is_canceled = FALSE
           `,
+        [sessionId, userId]
+      );
+
+      // синхронизируем schedules: started -> finished
+      // и фоллбек: если по ошибке запись осталась planned (не перевели на старте) — тоже закрываем её как finished
+      await pool.query(
+        `
+        WITH cand AS (
+          SELECT candidate_id FROM users WHERE id = $2
+        )
+        UPDATE internship_schedules
+           SET status = 'finished',
+               finished_at = NOW(),
+               session_id = COALESCE(session_id, $1)
+         WHERE candidate_id = (SELECT candidate_id FROM cand)
+           AND (
+             (status = 'started' AND session_id = $1)
+             OR (status = 'planned')  -- fallback, если не было перевода planned->started на старте
+           )
+        `,
         [sessionId, userId]
       );
 
