@@ -32,9 +32,10 @@ const {
 
 async function showUserInternshipMenu(ctx, admin, targetUserId) {
   const uRes = await pool.query(
-    "SELECT id, full_name, role, staff_status, intern_days_completed FROM users WHERE id = $1",
+    "SELECT id, full_name, role, staff_status, intern_days_completed, training_completed_at, training_total_steps_at_completion FROM users WHERE id = $1",
     [targetUserId]
   );
+
   if (!uRes.rows.length) {
     await ctx.reply("Пользователь не найден.");
     return;
@@ -95,6 +96,25 @@ async function showUserInternshipMenu(ctx, admin, targetUserId) {
     // чтобы на новой стажировке не было “с нуля”.
     const stepMap = await getUserOverallStepMap(user.id);
 
+    // общий процент по всем этапам (нужен для "Завершить обучение")
+    // parts уже содержит steps, поэтому считаем от него (без stepsRes)
+    const totalStepsAll = parts.reduce(
+      (acc, p) => acc + (p.steps?.length || 0),
+      0
+    );
+
+    let passedStepsAll = 0;
+    for (const p of parts) {
+      for (const s of p.steps || []) {
+        if (stepMap.get(s.id)?.is_passed === true) passedStepsAll += 1;
+      }
+    }
+
+    const overallPercent =
+      totalStepsAll === 0
+        ? 0
+        : Math.round((passedStepsAll / totalStepsAll) * 100);
+
     for (const part of parts) {
       if (!part.steps.length) continue;
 
@@ -125,12 +145,23 @@ async function showUserInternshipMenu(ctx, admin, targetUserId) {
       ),
     ]);
 
-    buttons.push([
-      Markup.button.callback(
-        "⏹ Закончить стажировку",
-        `admin_internship_finish_${activeSession.id}_${user.id}`
-      ),
-    ]);
+    // если общий % = 100 — показываем "Завершить обучение" (оно авто-закроет активную сессию)
+    if (overallPercent >= 100) {
+      buttons.push([
+        Markup.button.callback(
+          "🏁 Завершить обучение",
+          `admin_training_complete_${activeSession.id}_${user.id}`
+        ),
+      ]);
+    } else {
+      buttons.push([
+        Markup.button.callback(
+          "⏹ Закончить стажировку",
+          `admin_internship_finish_${activeSession.id}_${user.id}`
+        ),
+      ]);
+    }
+
     buttons.push([
       Markup.button.callback(
         "❌ Отменить стажировку",
@@ -189,7 +220,6 @@ async function askStartInternshipTradePoint(ctx, admin, targetUserId) {
 
   if (!points.length) {
     const keyboard = Markup.inlineKeyboard([
-      [Markup.button.callback("🔧 Торговые точки", "admin_trade_points")],
       [
         Markup.button.callback(
           "🔙 К стажировке пользователя",
@@ -943,6 +973,7 @@ async function showUserInternshipDetailsDay(ctx, admin, userId, sessionId) {
 
   let totalSteps = 0;
   let passedSteps = 0;
+
   for (const part of parts) {
     for (const step of part.steps || []) {
       totalSteps++;

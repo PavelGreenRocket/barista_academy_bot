@@ -1116,6 +1116,196 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
     }
   });
 
+  // ==========================
+  // ЗАВЕРШЕНИЕ ОБУЧЕНИЯ (100%)
+  // ==========================
+
+  bot.action(/^admin_training_complete_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const sessionId = parseInt(ctx.match[1], 10);
+      const userId = parseInt(ctx.match[2], 10);
+
+      const me = await ensureUser(ctx);
+      if (!me || !isAdmin(me)) return;
+
+      const keyboard = Markup.inlineKeyboard([
+        [
+          Markup.button.callback(
+            "✅ Да, завершить обучение",
+            `admin_training_complete_confirm_${sessionId}_${userId}`
+          ),
+        ],
+        [Markup.button.callback("❌ Нет", `admin_user_internship_${userId}`)],
+      ]);
+
+      await deliver(
+        ctx,
+        {
+          text: "Точно завершить обучение? Активная стажировка будет автоматически завершена, а прогресс зафиксирован.",
+          extra: keyboard,
+        },
+        { edit: true }
+      );
+    } catch (err) {
+      logError("admin_training_complete", err);
+    }
+  });
+
+  bot.action(/^admin_training_complete_confirm_(\d+)_(\d+)$/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const sessionId = parseInt(ctx.match[1], 10);
+      const userId = parseInt(ctx.match[2], 10);
+
+      const me = await ensureUser(ctx);
+      if (!me || !isAdmin(me)) return;
+
+      // берём day_number (нужно, чтобы обновить intern_days_completed)
+      const sRes = await pool.query(
+        `
+          SELECT id, day_number
+          FROM internship_sessions
+          WHERE id = $1 AND user_id = $2
+          LIMIT 1
+        `,
+        [sessionId, userId]
+      );
+      if (!sRes.rows.length) {
+        await ctx
+          .answerCbQuery("Сессия не найдена", { show_alert: false })
+          .catch(() => {});
+        return;
+      }
+      const dayNumber = Number(sRes.rows[0]?.day_number || 0);
+
+      // 1) авто-завершаем активную сессию (как при finish)
+      await pool.query(
+        `
+          UPDATE internship_sessions
+          SET finished_at = NOW()
+          WHERE id = $1 AND user_id = $2
+        `,
+        [sessionId, userId]
+      );
+
+      // 2) закрываем schedule (started -> finished, planned fallback)
+      await pool.query(
+        `
+        WITH cand AS (
+          SELECT candidate_id FROM users WHERE id = $2 LIMIT 1
+        )
+        UPDATE internship_schedules
+           SET status = 'finished',
+               finished_at = NOW(),
+               session_id = COALESCE(session_id, $1)
+         WHERE candidate_id = (SELECT candidate_id FROM cand)
+           AND (
+             (status = 'started' AND session_id = $1)
+             OR (status = 'planned')
+           )
+        `,
+        [sessionId, userId]
+      );
+
+      // 3) обновим прогресс по дням
+      if (dayNumber > 0) {
+        await pool.query(
+          `
+            UPDATE users
+            SET intern_days_completed = GREATEST(COALESCE(intern_days_completed,0), $2)
+            WHERE id = $1
+          `,
+          [userId, dayNumber]
+        );
+      }
+
+      // 4) фиксируем завершение обучения + "заморозку знаменателя" (вариант A)
+      const totalStepsRes = await pool.query(
+        `SELECT COUNT(*)::int AS cnt FROM internship_steps`
+      );
+      const totalStepsAtCompletion = Number(totalStepsRes.rows[0]?.cnt || 0);
+
+      await pool.query(
+        `
+          UPDATE users
+          SET training_completed_at = COALESCE(training_completed_at, NOW()),
+              training_total_steps_at_completion = COALESCE(training_total_steps_at_completion, $2)
+          WHERE id = $1
+        `,
+        [userId, totalStepsAtCompletion]
+      );
+
+      // 5) OUTBOX (LK): уведомление наставнику, что стажировка завершена + кнопка открыть карточку
+      // (чтобы в ЛК всё отработало аналогично обычному завершению)
+      try {
+        const infoRes = await pool.query(
+          `
+            SELECT u.candidate_id, u.full_name
+            FROM users u
+            WHERE u.id = $1
+            LIMIT 1
+          `,
+          [userId]
+        );
+
+        const candidateId = Number(infoRes.rows[0]?.candidate_id) || null;
+        const internName = infoRes.rows[0]?.full_name || "стажёр";
+
+        if (candidateId) {
+          await pool.query(
+            `
+              INSERT INTO outbox_events (destination, event_type, payload)
+              VALUES ('lk', 'internship_finished', $1::jsonb)
+            `,
+            [
+              JSON.stringify({
+                mentor_telegram_id: ctx.from?.id,
+                candidate_id: candidateId,
+                intern_name: internName,
+                intern_user_id: userId,
+                session_id: sessionId,
+              }),
+            ]
+          );
+        }
+      } catch (e) {
+        console.error(
+          "[training_complete -> internship_finished outbox] error:",
+          e
+        );
+      }
+
+      await ctx
+        .answerCbQuery("Обучение успешно завершено", { show_alert: false })
+        .catch(() => {});
+
+      // уводим в главное меню академии
+      await showMainMenu(ctx, me);
+
+      // 🔗 после завершения — сразу подсказка вернуться в ЛК
+      await ctx.reply("Вернуться в ЛК:", {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: "🤖 открыть ЛК-бот",
+                url: "https://t.me/green_rocket_lk_bot",
+              },
+            ],
+          ],
+        },
+      });
+    } catch (err) {
+      logError("admin_training_complete_confirm", err);
+      await ctx
+        .answerCbQuery("Не удалось завершить обучение. Попробуйте ещё раз.", {
+          show_alert: false,
+        })
+        .catch(() => {});
+    }
+  });
+
   bot.action(/^admin_internship_cancel_(\d+)_(\d+)$/, async (ctx) => {
     try {
       await ctx.answerCbQuery().catch(() => {});
