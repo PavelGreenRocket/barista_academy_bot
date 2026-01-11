@@ -110,10 +110,6 @@ async function showTopicBlocks(ctx, topicId) {
     Markup.button.callback("➕ Новый блок", `admin_new_block_${topicId}`),
   ]);
 
-  // 🔹 Новая кнопка для загрузки/замены PDF
-  buttons.push([
-    Markup.button.callback("📄 PDF для темы", `admin_topic_pdf_${topicId}`),
-  ]);
 
   buttons.push([
     Markup.button.callback("📝 Текст темы", `admin_edit_topic_text_${topicId}`),
@@ -180,7 +176,7 @@ async function showTopicsReorder(ctx) {
 
 async function showBlock(ctx, blockId) {
   const res = await pool.query(
-    `SELECT b.id, b.title, b.description, b.topic_id, t.title AS topic_title
+    `SELECT b.id, b.title, b.description, b.telegraph_url, b.video_url, b.topic_id, t.title AS topic_title
      FROM blocks b
      JOIN topics t ON b.topic_id = t.id
      WHERE b.id = $1`,
@@ -213,6 +209,14 @@ async function showBlock(ctx, blockId) {
         `admin_block_cards_${block.id}`
       ),
     ],
+
+    [
+      Markup.button.callback("📰 Telegraph блока", `admin_block_telegraph_${block.id}`),
+      Markup.button.callback(
+        block.video_url ? "🎬 Видео (прикреплено)" : "🎬 Видео (прикрепить)",
+        `admin_block_video_${block.id}`
+      ),
+    ],
     [
       Markup.button.callback(
         "🗑 Удалить блок",
@@ -225,6 +229,105 @@ async function showBlock(ctx, blockId) {
         `admin_topic_${block.topic_id}`
       ),
     ],
+  ]);
+
+  await deliver(ctx, { text, extra: keyboard }, { edit: true });
+}
+
+
+async function showBlockTelegraphScreen(ctx, blockId) {
+  const res = await pool.query(
+    `SELECT b.id, b.title, b.telegraph_url, b.topic_id, t.title AS topic_title
+     FROM blocks b
+     JOIN topics t ON b.topic_id = t.id
+     WHERE b.id = $1`,
+    [blockId]
+  );
+  if (!res.rows.length) {
+    await ctx.reply("Блок не найден.");
+    return;
+  }
+  const block = res.rows[0];
+
+  if (!block.telegraph_url) {
+    setState(ctx.from.id, { step: "await_block_telegraph_url", blockId });
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback("🔙 Назад", `admin_block_${blockId}`)],
+    ]);
+    await deliver(
+      ctx,
+      {
+        text:
+          "Отправьте ссылку telegra.ph одним сообщением (или «-» чтобы убрать).",
+        extra: keyboard,
+      },
+      { edit: true }
+    );
+    return;
+  }
+
+  const text =
+    `📰 Telegraph блока:\n\n` +
+    `${block.telegraph_url}\n\n` +
+    `Блок: "${block.title}"\nТема: "${block.topic_title}"`;
+
+  const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback(
+        "🔁 Заменить",
+        `admin_block_telegraph_replace_${blockId}`
+      ),
+    ],
+    [Markup.button.callback("🔙 Назад", `admin_block_${blockId}`)],
+  ]);
+
+  await deliver(ctx, { text, extra: keyboard }, { edit: true });
+}
+
+async function showBlockVideoScreen(ctx, blockId) {
+  const res = await pool.query(
+    `SELECT b.id, b.title, b.video_url, b.topic_id, t.title AS topic_title
+     FROM blocks b
+     JOIN topics t ON b.topic_id = t.id
+     WHERE b.id = $1`,
+    [blockId]
+  );
+  if (!res.rows.length) {
+    await ctx.reply("Блок не найден.");
+    return;
+  }
+  const block = res.rows[0];
+
+  if (!block.video_url) {
+    setState(ctx.from.id, { step: "await_block_video_url", blockId });
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback("🔙 Назад", `admin_block_${blockId}`)],
+    ]);
+    await deliver(
+      ctx,
+      {
+        text:
+          "Отправьте ссылку на видео одним сообщением (или «-» чтобы убрать).",
+        extra: keyboard,
+      },
+      { edit: true }
+    );
+    return;
+  }
+
+  const text =
+    `🎬 Видео блока:\n\n` +
+    `${block.video_url}\n\n` +
+    `Блок: "${block.title}"\nТема: "${block.topic_title}"`;
+
+  const keyboard = Markup.inlineKeyboard([
+    [
+      Markup.button.callback(
+        "🔁 Заменить",
+        `admin_block_video_replace_${blockId}`
+      ),
+    ],
+    [Markup.button.callback("🔙 Назад", `admin_block_${blockId}`)],
   ]);
 
   await deliver(ctx, { text, extra: keyboard }, { edit: true });
@@ -770,6 +873,91 @@ function registerAdminCommands(bot, ensureUser, logError) {
     } catch (err) {
       logError("admin_block_x", err);
     }
+
+  // Telegraph блока (админ)
+  bot.action(/admin_block_telegraph_(\d+)/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const user = await ensureUser(ctx);
+      if (!isAdmin(user)) return;
+
+      const blockId = parseInt(ctx.match[1], 10);
+      clearState(ctx.from.id);
+      await showBlockTelegraphScreen(ctx, blockId);
+    } catch (err) {
+      logError("admin_block_telegraph_x", err);
+    }
+  });
+
+  bot.action(/admin_block_telegraph_replace_(\d+)/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const user = await ensureUser(ctx);
+      if (!isAdmin(user)) return;
+
+      const blockId = parseInt(ctx.match[1], 10);
+      setState(ctx.from.id, { step: "await_block_telegraph_url", blockId });
+
+      const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback("🔙 Назад", `admin_block_telegraph_${blockId}`)],
+      ]);
+
+      await deliver(
+        ctx,
+        {
+          text:
+            "Отправьте ссылку telegra.ph одним сообщением (или «-» чтобы убрать).",
+          extra: keyboard,
+        },
+        { edit: true }
+      );
+    } catch (err) {
+      logError("admin_block_telegraph_replace_x", err);
+    }
+  });
+
+  // Видео блока (админ)
+  bot.action(/admin_block_video_(\d+)/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const user = await ensureUser(ctx);
+      if (!isAdmin(user)) return;
+
+      const blockId = parseInt(ctx.match[1], 10);
+      clearState(ctx.from.id);
+      await showBlockVideoScreen(ctx, blockId);
+    } catch (err) {
+      logError("admin_block_video_x", err);
+    }
+  });
+
+  bot.action(/admin_block_video_replace_(\d+)/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const user = await ensureUser(ctx);
+      if (!isAdmin(user)) return;
+
+      const blockId = parseInt(ctx.match[1], 10);
+      setState(ctx.from.id, { step: "await_block_video_url", blockId });
+
+      const keyboard = Markup.inlineKeyboard([
+        [Markup.button.callback("🔙 Назад", `admin_block_video_${blockId}`)],
+      ]);
+
+      await deliver(
+        ctx,
+        {
+          text:
+            "Отправьте ссылку на видео одним сообщением (или «-» чтобы убрать).",
+          extra: keyboard,
+        },
+        { edit: true }
+      );
+    } catch (err) {
+      logError("admin_block_video_replace_x", err);
+    }
+  });
+
   });
 
   // перемещение блока вверх
@@ -1125,6 +1313,33 @@ function registerAdminCommands(bot, ensureUser, logError) {
         await showBlock(ctx, blockId);
         return;
       }
+
+      // Telegraph блока
+      if (adminState.step === "await_block_telegraph_url") {
+        const blockId = adminState.blockId;
+        const url = text === "-" ? null : text;
+        await pool.query("UPDATE blocks SET telegraph_url = $1 WHERE id = $2", [
+          url,
+          blockId,
+        ]);
+        clearState(ctx.from.id);
+        await showBlockTelegraphScreen(ctx, blockId);
+        return;
+      }
+
+      // Видео блока
+      if (adminState.step === "await_block_video_url") {
+        const blockId = adminState.blockId;
+        const url = text === "-" ? null : text;
+        await pool.query("UPDATE blocks SET video_url = $1 WHERE id = $2", [
+          url,
+          blockId,
+        ]);
+        clearState(ctx.from.id);
+        await showBlockVideoScreen(ctx, blockId);
+        return;
+      }
+
 
       return next();
     } catch (err) {

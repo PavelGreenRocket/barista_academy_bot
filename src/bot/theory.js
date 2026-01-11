@@ -156,12 +156,6 @@ async function showTopicBlocks(ctx, userId, topicId) {
       `theory_block_${b.id}`
     ),
   ]);
-
-  // 🔹 новая кнопка PDF, всегда показываем
-  buttons.push([
-    Markup.button.callback("подробно в PDF 📄", `theory_topic_pdf_${topic.id}`),
-  ]);
-
   // кнопка назад к списку тем
   buttons.push([Markup.button.callback("🔙 К темам", "user_theory")]);
 
@@ -174,13 +168,15 @@ async function showTopicBlocks(ctx, userId, topicId) {
 
 // ---------- ТЕКСТ БЛОКА В ТЕОРИИ (без карточек) ----------
 
-async function showBlockDescription(ctx, userId, blockId) {
+async function showBlockDescription(ctx, userId, blockId, view = "theory") {
   const res = await pool.query(
     `
     SELECT 
       b.id,
       b.title,
       b.description,
+      b.telegraph_url,
+      b.video_url,
       b.topic_id,
       t.title AS topic_title
     FROM blocks b
@@ -197,22 +193,76 @@ async function showBlockDescription(ctx, userId, blockId) {
 
   const block = res.rows[0];
 
-  let text = `📦 Блок: ${block.title}\n` + `📚 Тема: ${block.topic_title}\n\n`;
+  let text =
+    `📦 Блок: ${block.title}
+` +
+    `📚 Тема: ${block.topic_title}
 
+`;
+
+  // Текст блока: если нет — просто не выводим ничего
   if (block.description && block.description.trim()) {
     text += block.description.trim();
-  } else {
-    text += "Текст для этого блока пока не добавлен.";
   }
 
-  const buttons = [
-    [Markup.button.callback("🔙 К теме", `theory_topic_${block.topic_id}`)],
-  ];
+  const hasTheory = Boolean(block.telegraph_url);
+  const hasVideo = Boolean(block.video_url);
 
-  await deliver(ctx, {
-    text,
-    extra: Markup.inlineKeyboard(buttons),
-  });
+  // Переключатели вкладок (показываем только доступные)
+  const buttons = [];
+  const tabsRow = [];
+
+  if (hasTheory) {
+    tabsRow.push(
+      Markup.button.callback(
+        `${view === "theory" ? "📄 Теория ✅" : "📄 Теория"}`,
+        `theory_block_view_theory_${block.id}`
+      )
+    );
+  }
+
+  if (hasVideo) {
+    tabsRow.push(
+      Markup.button.callback(
+        `${view === "video" ? "🎬 Видео ✅" : "🎬 Видео"}`,
+        `theory_block_view_video_${block.id}`
+      )
+    );
+  }
+
+  if (tabsRow.length) buttons.push(tabsRow);
+
+  // Контент вкладки
+  let parse_mode;
+  let link_preview_options;
+
+  const needsGap = !(text.endsWith("\n\n") || text.endsWith("\n"));
+
+  if (view === "video" && hasVideo) {
+    text += `${needsGap ? "\n\n" : ""}🎬 Видео:\n${block.video_url}`;
+    link_preview_options = { url: block.video_url };
+  } else if (hasTheory) {
+    text += `${needsGap ? "\n\n" : ""}<a href="${
+      block.telegraph_url
+    }">📄 Telegraph</a>`;
+    parse_mode = "HTML";
+    link_preview_options = { url: block.telegraph_url };
+  }
+
+  buttons.push([
+    Markup.button.callback("🔙 К теме", `theory_topic_${block.topic_id}`),
+  ]);
+
+  await deliver(
+    ctx,
+    {
+      text,
+      extra: Markup.inlineKeyboard(buttons),
+      ...(parse_mode ? { parse_mode } : {}),
+      ...(link_preview_options ? { link_preview_options } : {}),
+    },
+    { edit: true }
+  );
 }
 
 // ---------- КАРТОЧКИ ПО БЛОКУ ----------
@@ -378,34 +428,6 @@ function registerTheory(bot, ensureUser, logError) {
     }
   });
 
-  // отправка PDF по теме
-  bot.action(/theory_topic_pdf_(\d+)/, async (ctx) => {
-    try {
-      await ctx.answerCbQuery().catch(() => {});
-      const user = await ensureUser(ctx);
-      if (!user) return;
-
-      const topicId = parseInt(ctx.match[1], 10);
-      const res = await pool.query(
-        "SELECT title, pdf_file FROM topics WHERE id = $1",
-        [topicId]
-      );
-      if (!res.rows.length || !res.rows[0].pdf_file) {
-        await ctx.reply("Для этой темы пока не прикреплён PDF.");
-        return;
-      }
-
-      const topic = res.rows[0];
-
-      await ctx.replyWithDocument(topic.pdf_file, {
-        caption: `Тема: ${topic.title}`,
-      });
-    } catch (err) {
-      logError("theory_topic_pdf_x", err);
-      await ctx.reply("Не удалось отправить PDF по этой теме.");
-    }
-  });
-
   // выбор блока — старт карточек
   bot.action(/theory_block_(\d+)/, async (ctx) => {
     try {
@@ -421,6 +443,31 @@ function registerTheory(bot, ensureUser, logError) {
     } catch (err) {
       logError("theory_block_x", err);
       await ctx.reply("Не удалось открыть блок. Попробуй ещё раз.");
+    }
+  });
+
+  // переключение вкладок в просмотре блока
+  bot.action(/theory_block_view_theory_(\d+)/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const user = await ensureUser(ctx);
+      if (!user) return;
+      const blockId = parseInt(ctx.match[1], 10);
+      await showBlockDescription(ctx, user.id, blockId, "theory");
+    } catch (err) {
+      logError("theory_block_view_theory_x", err);
+    }
+  });
+
+  bot.action(/theory_block_view_video_(\d+)/, async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const user = await ensureUser(ctx);
+      if (!user) return;
+      const blockId = parseInt(ctx.match[1], 10);
+      await showBlockDescription(ctx, user.id, blockId, "video");
+    } catch (err) {
+      logError("theory_block_view_video_x", err);
     }
   });
 
