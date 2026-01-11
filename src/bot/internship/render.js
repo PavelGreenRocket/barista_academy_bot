@@ -1166,8 +1166,21 @@ async function showInternshipPart(ctx, partId) {
 }
 
 async function showInternshipSection(ctx, sectionId, partId) {
+  const hasTelegraphMentor = await columnExists(
+    "internship_sections",
+    "telegraph_url"
+  );
+  const hasTelegraphIntern = await columnExists(
+    "internship_sections",
+    "telegraph_url_intern"
+  );
+
+  const cols = ["id", "title", "order_index", "duration_days"];
+  if (hasTelegraphMentor) cols.push("telegraph_url");
+  if (hasTelegraphIntern) cols.push("telegraph_url_intern");
+
   const sRes = await pool.query(
-    `SELECT id, title, order_index, telegraph_url, duration_days FROM internship_sections WHERE id=$1`,
+    `SELECT ${cols.join(", ")} FROM internship_sections WHERE id=$1`,
     [sectionId]
   );
   if (!sRes.rows.length) {
@@ -1177,50 +1190,178 @@ async function showInternshipSection(ctx, sectionId, partId) {
   const sec = sRes.rows[0];
 
   let text =
-    `Раздел стажировки:\n` +
-    `Название: ${sec.title}\n` +
-    `Порядок: ${sec.order_index}\n` +
-    `Telegraph: ${sec.telegraph_url ? "✅ прикреплён" : "❌ нет"}\n` +
-    `Срок: ${sec.duration_days ? `${sec.duration_days} дн.` : "не указан"}\n`;
+    `Раздел стажировки:
+` +
+    `Название: ${sec.title}
+` +
+    `Порядок: ${sec.order_index}
+`;
 
-  const keyboard = Markup.inlineKeyboard([
-    [
-      Markup.button.callback(
-        "✏️ Переименовать раздел",
-        `admin_internship_section_rename_${sec.id}_${partId}`
-      ),
-    ],
-    [
-      Markup.button.callback(
-        "📝 Telegraph (теория)",
-        `admin_internship_section_telegraph_${sec.id}_${partId}`
-      ),
-    ],
-    [
-      Markup.button.callback(
-        sec.duration_days
-          ? `📅 Изменить срок для раздела (${sec.duration_days} дн.)`
-          : "📅 Добавить срок для раздела",
-        `admin_internship_section_duration_${sec.id}_${partId}`
-      ),
-    ],
-    [
-      Markup.button.callback(
-        "📋 Этапы раздела",
-        `admin_internship_section_steps_${sec.id}_${partId}`
-      ),
-    ],
-    [
-      Markup.button.callback(
-        "🗑 Удалить раздел",
-        `admin_internship_section_del_${sec.id}_${partId}`
-      ),
-    ],
-    [Markup.button.callback("🔙 К части", `admin_internship_part_${partId}`)],
+  if (hasTelegraphMentor) {
+    text += `Telegraph (для наставника): ${
+      sec.telegraph_url ? "✅ прикреплён" : "❌ нет"
+    }
+`;
+  }
+  if (hasTelegraphIntern) {
+    text += `Telegraph (для стажёра): ${
+      sec.telegraph_url_intern ? "✅ прикреплён" : "❌ нет"
+    }
+`;
+  }
+
+  text += `Срок: ${
+    sec.duration_days ? `${sec.duration_days} дн.` : "не указан"
+  }
+`;
+
+  const rows = [];
+
+  rows.push([
+    Markup.button.callback(
+      "✏️ Переименовать раздел",
+      `admin_internship_section_rename_${sec.id}_${partId}`
+    ),
   ]);
 
-  await deliver(ctx, { text, extra: keyboard }, { edit: true });
+  // Telegraph buttons: показываем только если колонка есть
+  if (hasTelegraphMentor || hasTelegraphIntern) {
+    const tRow = [];
+    if (hasTelegraphMentor) {
+      tRow.push(
+        Markup.button.callback(
+          "📝 Telegraph (для наставника)",
+          `admin_internship_section_telegraph_mentor_${sec.id}_${partId}`
+        )
+      );
+    }
+    if (hasTelegraphIntern) {
+      tRow.push(
+        Markup.button.callback(
+          "📝 Telegraph (для стажёра)",
+          `admin_internship_section_telegraph_intern_${sec.id}_${partId}`
+        )
+      );
+    }
+    rows.push(tRow);
+  }
+
+  rows.push([
+    Markup.button.callback(
+      sec.duration_days
+        ? `📅 Изменить срок для раздела (${sec.duration_days} дн.)`
+        : "📅 Добавить срок для раздела",
+      `admin_internship_section_duration_${sec.id}_${partId}`
+    ),
+  ]);
+
+  rows.push([
+    Markup.button.callback(
+      "📋 Этапы раздела",
+      `admin_internship_section_steps_${sec.id}_${partId}`
+    ),
+  ]);
+
+  rows.push([
+    Markup.button.callback(
+      "🗑 Удалить раздел",
+      `admin_internship_section_del_${sec.id}_${partId}`
+    ),
+  ]);
+
+  rows.push([
+    Markup.button.callback("🔙 К части", `admin_internship_part_${partId}`),
+  ]);
+
+  await deliver(ctx, { text, extra: Markup.inlineKeyboard(rows) }, { edit: true });
 }
+
+async function showInternshipSectionTelegraphView(
+  ctx,
+  sectionId,
+  partId,
+  target // "mentor" | "intern"
+) {
+  const hasTelegraphMentor = await columnExists(
+    "internship_sections",
+    "telegraph_url"
+  );
+  const hasTelegraphIntern = await columnExists(
+    "internship_sections",
+    "telegraph_url_intern"
+  );
+
+  if (target === "mentor" && !hasTelegraphMentor) {
+    await ctx.reply("В таблице internship_sections нет колонки telegraph_url.");
+    return;
+  }
+  if (target === "intern" && !hasTelegraphIntern) {
+    await ctx.reply(
+      "В таблице internship_sections нет колонки telegraph_url_intern."
+    );
+    return;
+  }
+
+  const cols = ["id", "title"];
+  if (hasTelegraphMentor) cols.push("telegraph_url");
+  if (hasTelegraphIntern) cols.push("telegraph_url_intern");
+
+  const sRes = await pool.query(
+    `SELECT ${cols.join(", ")} FROM internship_sections WHERE id=$1 LIMIT 1`,
+    [sectionId]
+  );
+  if (!sRes.rows.length) return ctx.reply("Раздел не найден.");
+  const sec = sRes.rows[0];
+
+  const url =
+    target === "mentor" ? sec.telegraph_url : sec.telegraph_url_intern;
+
+  const who = target === "mentor" ? "наставника" : "стажёра";
+
+  let text =
+    `📝 Telegraph (для ${who})
+
+` +
+    `Раздел: ${sec.title}
+
+` +
+    (url ? `Текущая ссылка:
+${url}
+` : `Ссылка ещё не прикреплена.
+`);
+
+  const buttons = [];
+
+  if (url) {
+    buttons.push([
+      Markup.button.callback(
+        "🔁 Заменить",
+        `admin_internship_section_telegraph_replace_${target}_${sectionId}_${partId}`
+      ),
+    ]);
+  } else {
+    buttons.push([
+      Markup.button.callback(
+        "➕ Прикрепить",
+        `admin_internship_section_telegraph_replace_${target}_${sectionId}_${partId}`
+      ),
+    ]);
+  }
+
+  buttons.push([
+    Markup.button.callback(
+      "🔙 Назад",
+      `admin_internship_section_edit_${sectionId}_${partId}`
+    ),
+  ]);
+
+  await deliver(
+    ctx,
+    { text, extra: Markup.inlineKeyboard(buttons) },
+    { edit: true }
+  );
+}
+
 
 // ---------- reorder screens ----------
 
@@ -1456,6 +1597,13 @@ async function showInternshipStepSettings(ctx, stepId, sectionId, partId) {
     ),
   ]);
 
+  rows.push([
+    Markup.button.callback(
+      "🔘 Изменить тип",
+      `admin_internship_step_type_${st.id}_${sectionId}_${partId}`
+    ),
+  ]);
+
   if (hasStepTelegraph) {
     rows.push([
       Markup.button.callback(
@@ -1518,6 +1666,7 @@ module.exports = {
   showInternshipConfigMenu,
   showInternshipPart,
   showInternshipSection,
+  showInternshipSectionTelegraphView,
 
   // reorder & steps screens
   showInternshipPartSectionsReorder,

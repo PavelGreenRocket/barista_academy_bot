@@ -56,6 +56,7 @@ const {
   showInternshipConfigMenu,
   showInternshipPart,
   showInternshipSection,
+  showInternshipSectionTelegraphView,
 
   // reorder & steps screens
   showInternshipPartSectionsReorder,
@@ -63,6 +64,25 @@ const {
   showInternshipSectionStepsReorder,
   showInternshipStepSettings,
 } = require("./render");
+
+// ------------------ helpers ------------------
+
+function stepTypeKeyboard(prefix, backCbData) {
+  const rows = [
+    [
+      Markup.button.callback("📷 Фото", `${prefix}photo`),
+      Markup.button.callback("🎥 Видео", `${prefix}video`),
+    ],
+    [Markup.button.callback("🔘 Обычный", `${prefix}simple`)],
+  ];
+
+  if (backCbData) {
+    rows.push([Markup.button.callback("🔙 Назад", backCbData)]);
+  }
+
+  return Markup.inlineKeyboard(rows);
+}
+
 
 /**
  * В render.js (модуль 3) мы не унесли один экран из монолита:
@@ -1757,16 +1777,36 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
         return;
       }
 
-      // РАЗДЕЛ: telegraph
-      if (state.mode === "await_section_telegraph") {
+      // РАЗДЕЛ: telegraph (для наставника / стажёра)
+      if (
+        state.mode === "await_section_telegraph" ||
+        state.mode === "await_section_telegraph_mentor" ||
+        state.mode === "await_section_telegraph_intern"
+      ) {
+        const target =
+          state.mode === "await_section_telegraph_intern" ? "intern" : "mentor";
+
+        const colName =
+          target === "intern" ? "telegraph_url_intern" : "telegraph_url";
+
+        const ok = await columnExists("internship_sections", colName);
+        if (!ok) {
+          configStates.delete(ctx.from.id);
+          await ctx.reply(`В таблице internship_sections нет колонки ${colName}.`);
+          await showInternshipSection(ctx, state.sectionId, state.partId);
+          return;
+        }
+
         if (text !== "-" && !isTelegraphUrl(text)) {
           await ctx.reply("Нужна ссылка telegra.ph (или «-» чтобы убрать).");
           return;
         }
+
         await pool.query(
-          "UPDATE internship_sections SET telegraph_url=$1 WHERE id=$2",
+          `UPDATE internship_sections SET ${colName}=$1 WHERE id=$2`,
           [text === "-" ? null : text, state.sectionId]
         );
+
         configStates.delete(ctx.from.id);
         await showInternshipSection(ctx, state.sectionId, state.partId);
         return;
@@ -1799,17 +1839,29 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
         return;
       }
 
-      // ЭТАП: новый
+      // ЭТАП: новый (шаг 1/2 — ввод названия)
       if (state.mode === "new_step") {
-        const nextIdx = await getNextStepOrderIndex(state.sectionId);
+        const title = (text || "").trim();
+        if (!title) {
+          await ctx.reply("Название не может быть пустым. Введите ещё раз.");
+          return;
+        }
 
-        await pool.query(
-          "INSERT INTO internship_steps(part_id, section_id, title, step_type, order_index) VALUES ($1,$2,$3,'simple',$4)",
-          [state.partId, state.sectionId, text, nextIdx]
+        // сохраняем промежуточное состояние и просим выбрать тип
+        configStates.set(ctx.from.id, {
+          mode: "new_step_choose_type",
+          sectionId: state.sectionId,
+          partId: state.partId,
+          title,
+        });
+
+        await ctx.reply(
+          "Выберите тип этапа:",
+          stepTypeKeyboard(
+            `admin_internship_step_new_type_${state.sectionId}_${state.partId}_`,
+            `admin_internship_step_new_cancel_${state.sectionId}_${state.partId}`
+          )
         );
-
-        configStates.delete(ctx.from.id);
-        await showInternshipSectionSteps(ctx, state.sectionId, state.partId);
         return;
       }
 
@@ -2108,6 +2160,7 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
   bot.action(
     /^admin_internship_section_telegraph_(\d+)_(\d+)$/,
     async (ctx) => {
+      // backward-compat: старую кнопку считаем telegraph для наставника
       try {
         await ctx.answerCbQuery().catch(() => {});
         const sectionId = parseInt(ctx.match[1], 10);
@@ -2116,21 +2169,71 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
         const me = await ensureUser(ctx);
         if (!me || !isAdmin(me)) return;
 
-        configStates.set(ctx.from.id, {
-          mode: "await_section_telegraph",
-          sectionId,
-          partId,
-        });
-        await ctx.reply(
-          "Отправьте ссылку telegra.ph одним сообщением (или «-» чтобы убрать)."
-        );
+        await showInternshipSectionTelegraphView(ctx, sectionId, partId, "mentor");
       } catch (err) {
         logError("admin_internship_section_telegraph", err);
       }
     }
   );
 
-  bot.action(/^admin_internship_section_duration_(\d+)_(\d+)$/, async (ctx) => {
+  bot.action(
+    /^admin_internship_section_telegraph_(mentor|intern)_(\d+)_(\d+)$/,
+    async (ctx) => {
+      try {
+        await ctx.answerCbQuery().catch(() => {});
+        const target = ctx.match[1];
+        const sectionId = parseInt(ctx.match[2], 10);
+        const partId = parseInt(ctx.match[3], 10);
+
+        const me = await ensureUser(ctx);
+        if (!me || !isAdmin(me)) return;
+
+        await showInternshipSectionTelegraphView(ctx, sectionId, partId, target);
+      } catch (err) {
+        logError("admin_internship_section_telegraph_role", err);
+      }
+    }
+  );
+
+  bot.action(
+    /^admin_internship_section_telegraph_replace_(mentor|intern)_(\d+)_(\d+)$/,
+    async (ctx) => {
+      try {
+        await ctx.answerCbQuery().catch(() => {});
+        const target = ctx.match[1];
+        const sectionId = parseInt(ctx.match[2], 10);
+        const partId = parseInt(ctx.match[3], 10);
+
+        const me = await ensureUser(ctx);
+        if (!me || !isAdmin(me)) return;
+
+        configStates.set(ctx.from.id, {
+          mode:
+            target === "intern"
+              ? "await_section_telegraph_intern"
+              : "await_section_telegraph_mentor",
+          sectionId,
+          partId,
+        });
+
+        await ctx.reply(
+          "Отправьте ссылку telegra.ph одним сообщением (или «-» чтобы убрать).",
+          Markup.inlineKeyboard([
+            [
+              Markup.button.callback(
+                "🔙 Назад",
+                `admin_internship_section_telegraph_${target}_${sectionId}_${partId}`
+              ),
+            ],
+          ])
+        );
+      } catch (err) {
+        logError("admin_internship_section_telegraph_replace", err);
+      }
+    }
+  );
+
+bot.action(/^admin_internship_section_duration_(\d+)_(\d+)$/, async (ctx) => {
     try {
       await ctx.answerCbQuery().catch(() => {});
       const sectionId = parseInt(ctx.match[1], 10);
@@ -2228,7 +2331,119 @@ function registerInternship(bot, ensureUser, logError, showMainMenu) {
     }
   });
 
+  
+
+  // выбор типа для нового этапа (шаг 2/2)
   bot.action(
+    /^admin_internship_step_new_type_(\d+)_(\d+)_(simple|photo|video)$/,
+    async (ctx) => {
+      try {
+        await ctx.answerCbQuery().catch(() => {});
+        const sectionId = parseInt(ctx.match[1], 10);
+        const partId = parseInt(ctx.match[2], 10);
+        const stepType = ctx.match[3];
+
+        const me = await ensureUser(ctx);
+        if (!me || !isAdmin(me)) return;
+
+        const state = configStates.get(ctx.from.id);
+        if (
+          !state ||
+          state.mode !== "new_step_choose_type" ||
+          state.sectionId !== sectionId ||
+          state.partId !== partId
+        ) {
+          await ctx.reply("Состояние добавления этапа устарело. Попробуйте ещё раз.");
+          configStates.delete(ctx.from.id);
+          await showInternshipSectionSteps(ctx, sectionId, partId);
+          return;
+        }
+
+        const nextIdx = await getNextStepOrderIndex(sectionId);
+
+        await pool.query(
+          "INSERT INTO internship_steps(part_id, section_id, title, step_type, order_index) VALUES ($1,$2,$3,$4,$5)",
+          [partId, sectionId, state.title, stepType, nextIdx]
+        );
+
+        configStates.delete(ctx.from.id);
+        await showInternshipSectionSteps(ctx, sectionId, partId);
+      } catch (err) {
+        logError("admin_internship_step_new_type", err);
+      }
+    }
+  );
+
+  bot.action(
+    /^admin_internship_step_new_cancel_(\d+)_(\d+)$/,
+    async (ctx) => {
+      try {
+        await ctx.answerCbQuery().catch(() => {});
+        const sectionId = parseInt(ctx.match[1], 10);
+        const partId = parseInt(ctx.match[2], 10);
+
+        const me = await ensureUser(ctx);
+        if (!me || !isAdmin(me)) return;
+
+        configStates.delete(ctx.from.id);
+        await showInternshipSectionSteps(ctx, sectionId, partId);
+      } catch (err) {
+        logError("admin_internship_step_new_cancel", err);
+      }
+    }
+  );
+
+  // изменение типа существующего этапа
+  bot.action(
+    /^admin_internship_step_type_(\d+)_(\d+)_(\d+)$/,
+    async (ctx) => {
+      try {
+        await ctx.answerCbQuery().catch(() => {});
+        const stepId = parseInt(ctx.match[1], 10);
+        const sectionId = parseInt(ctx.match[2], 10);
+        const partId = parseInt(ctx.match[3], 10);
+
+        const me = await ensureUser(ctx);
+        if (!me || !isAdmin(me)) return;
+
+        await ctx.reply(
+          "Выберите новый тип этапа:",
+          stepTypeKeyboard(
+            `admin_internship_step_type_set_${stepId}_${sectionId}_${partId}_`,
+            `admin_internship_step_edit_${stepId}_${sectionId}_${partId}`
+          )
+        );
+      } catch (err) {
+        logError("admin_internship_step_type", err);
+      }
+    }
+  );
+
+  bot.action(
+    /^admin_internship_step_type_set_(\d+)_(\d+)_(\d+)_(simple|photo|video)$/,
+    async (ctx) => {
+      try {
+        await ctx.answerCbQuery().catch(() => {});
+        const stepId = parseInt(ctx.match[1], 10);
+        const sectionId = parseInt(ctx.match[2], 10);
+        const partId = parseInt(ctx.match[3], 10);
+        const stepType = ctx.match[4];
+
+        const me = await ensureUser(ctx);
+        if (!me || !isAdmin(me)) return;
+
+        await pool.query("UPDATE internship_steps SET step_type=$1 WHERE id=$2", [
+          stepType,
+          stepId,
+        ]);
+
+        await showInternshipStepSettings(ctx, stepId, sectionId, partId);
+      } catch (err) {
+        logError("admin_internship_step_type_set", err);
+      }
+    }
+  );
+bot.action(
     /^admin_internship_step_rename2_(\d+)_(\d+)_(\d+)$/,
     async (ctx) => {
       try {
