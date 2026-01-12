@@ -70,11 +70,13 @@ async function showTrainMenu(ctx, userId, targetUserId = null) {
     "Выбери режим:\n" +
     "• Тест по одной теме\n" +
     "• Тест по всем темам\n" +
+    "• Тесты по ошибкам\n" +
     "• История твоих тестов";
 
   const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback("🧩 Тест по теме", "train_by_topic")],
     [Markup.button.callback("🌍 Тест по всем темам", "train_all_topics")],
+    [Markup.button.callback("⚠️ Тесты по ошибкам", "train_mistakes")],
     [Markup.button.callback("📜 История тестов", "train_history")],
     [Markup.button.callback("🔙 В главное меню", "back_main")],
   ]);
@@ -102,6 +104,39 @@ async function getAllBlocks() {
     "SELECT id, topic_id FROM blocks ORDER BY topic_id, order_index, id"
   );
   return res.rows;
+}
+
+// карточки, где последний ответ пользователя был неверным ("ошибки")
+// дополнительно фильтруем по allowedLevels (уровни сложности)
+async function getMistakeCardPairs(userId, allowedLevels, limit = 50) {
+  // Важно: в test_session_answers нет timestamp, поэтому берём created_at из test_sessions
+  // и (на всякий случай) tsa.id как тай-брейкер для порядка.
+  const res = await pool.query(
+    `
+    WITH latest AS (
+      SELECT DISTINCT ON (tsa.card_id)
+        tsa.card_id,
+        tsa.is_correct,
+        ts.created_at
+      FROM test_session_answers tsa
+      JOIN test_sessions ts ON ts.id = tsa.session_id
+      WHERE ts.user_id = $1
+      ORDER BY tsa.card_id, ts.created_at DESC, tsa.id DESC
+    )
+    SELECT c.id AS card_id,
+           c.block_id,
+           l.created_at
+    FROM latest l
+    JOIN cards c ON c.id = l.card_id
+    WHERE l.is_correct = FALSE
+      AND COALESCE(c.difficulty, 1) = ANY($2)
+    ORDER BY l.created_at DESC
+    LIMIT $3
+  `,
+    [userId, allowedLevels, limit]
+  );
+
+  return res.rows.map((r) => ({ blockId: r.block_id, cardId: r.card_id }));
 }
 
 // теперь фильтруем по уровню сложности
@@ -493,6 +528,73 @@ function registerTrain(bot, ensureUser, logError) {
     }
   });
 
+  // выбор режима: тесты по ошибкам
+  bot.action("train_mistakes", async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+
+      const targetUserId = ctx.session?.adminTestingUser || admin.id;
+      const conductedBy = ctx.session?.adminTestingUser ? admin.id : null;
+
+      clearTrainSession(ctx.from.id);
+
+      const levelInfo = await getUserTrainLevelInfo(targetUserId);
+
+      const pairs = await getMistakeCardPairs(
+        targetUserId,
+        levelInfo.allowedLevels,
+        50
+      );
+
+      if (!pairs.length) {
+        const keyboard = Markup.inlineKeyboard([
+          [Markup.button.callback("🔙 В тренировки", "user_train")],
+          [Markup.button.callback("🔙 В главное меню", "back_main")],
+        ]);
+        await deliver(
+          ctx,
+          {
+            text: "✅ У тебя пока нет ошибок для повторения.",
+            extra: keyboard,
+          },
+          { edit: true }
+        );
+        return;
+      }
+
+      const cards = await loadCardsDetails(pairs);
+      if (!cards.length) {
+        await ctx.reply("Не удалось собрать вопросы по ошибкам.");
+        return;
+      }
+
+      const sessionRes = await pool.query(
+        `INSERT INTO test_sessions (user_id, mode, topic_id, question_count, correct_count, conducted_by)
+         VALUES ($1, 'mistakes', NULL, $2, 0, $3)
+         RETURNING id`,
+        [targetUserId, cards.length, conductedBy]
+      );
+
+      const sessionId = sessionRes.rows[0].id;
+
+      setTrainSession(ctx.from.id, {
+        sessionId,
+        mode: "mistakes",
+        topicId: null,
+        cards,
+        index: 0,
+        showAnswer: false,
+        correctCount: 0,
+      });
+
+      await renderCurrentTrainCard(ctx, ctx.from.id);
+    } catch (err) {
+      logError("train_mistakes", err);
+      await ctx.reply("Не удалось запустить тесты по ошибкам.");
+    }
+  });
+
   // показать ответ
   bot.action("train_show_answer", async (ctx) => {
     try {
@@ -638,6 +740,8 @@ function registerTrain(bot, ensureUser, logError) {
         const modeLabel =
           row.mode === "topic"
             ? `по теме: "${row.topic_title || "Без названия"}"`
+            : row.mode === "mistakes"
+            ? "по ошибкам"
             : "по всем темам";
 
         const total = row.question_count;

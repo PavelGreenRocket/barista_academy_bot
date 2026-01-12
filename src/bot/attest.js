@@ -175,7 +175,7 @@ async function showAdminAttestMenu(ctx) {
 
 async function showAdminAttestItem(ctx, itemId) {
   const res = await pool.query(
-    "SELECT id, title, description, is_active FROM attestation_items WHERE id = $1",
+    "SELECT id, title, description, is_active, COALESCE(is_default, FALSE) AS is_default FROM attestation_items WHERE id = $1",
     [itemId]
   );
   if (!res.rows.length) {
@@ -195,13 +195,23 @@ async function showAdminAttestItem(ctx, itemId) {
     text += `\n\nОписание:\n${row.description}`;
   }
 
-  const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback("✏ Название", `admin_attest_rename_${row.id}`)],
-    [Markup.button.callback("📝 Описание", `admin_attest_desc_${row.id}`)],
-    [Markup.button.callback("👁 Вкл/Выкл", `admin_attest_toggle_${row.id}`)],
-    [Markup.button.callback("🗑 Удалить", `admin_attest_delete_${row.id}`)],
-    [Markup.button.callback("🔙 К списку", "admin_attest_menu")],
-  ]);
+  const kbRows = [];
+
+  // Дефолтные элементы нельзя переименовывать/удалять — только выключать
+  if (!row.is_default) {
+    kbRows.push([Markup.button.callback("✏ Название", `admin_attest_rename_${row.id}`)]);
+    kbRows.push([Markup.button.callback("📝 Описание", `admin_attest_desc_${row.id}`)]);
+  }
+
+  kbRows.push([Markup.button.callback("👁 Вкл/Выкл", `admin_attest_toggle_${row.id}`)]);
+
+  if (!row.is_default) {
+    kbRows.push([Markup.button.callback("🗑 Удалить", `admin_attest_delete_${row.id}`)]);
+  }
+
+  kbRows.push([Markup.button.callback("🔙 К списку", "admin_attest_menu")]);
+
+  const keyboard = Markup.inlineKeyboard(kbRows);
 
   await deliver(ctx, { text, extra: keyboard }, { edit: true });
 }
@@ -307,6 +317,15 @@ function registerAttest(bot, ensureUser, logError) {
       if (!isAdmin(user)) return;
 
       const itemId = parseInt(ctx.match[1], 10);
+      const chk = await pool.query(
+        "SELECT COALESCE(is_default, FALSE) AS is_default FROM attestation_items WHERE id = $1",
+        [itemId]
+      );
+      if (chk.rows[0]?.is_default) {
+        await ctx.answerCbQuery("Этот элемент нельзя переименовывать", { show_alert: false }).catch(() => {});
+        await showAdminAttestItem(ctx, itemId);
+        return;
+      }
       setState(ctx.from.id, { step: "attest_rename_title", itemId });
 
       const keyboard = Markup.inlineKeyboard([
@@ -330,6 +349,15 @@ function registerAttest(bot, ensureUser, logError) {
       if (!isAdmin(user)) return;
 
       const itemId = parseInt(ctx.match[1], 10);
+      const chk = await pool.query(
+        "SELECT COALESCE(is_default, FALSE) AS is_default FROM attestation_items WHERE id = $1",
+        [itemId]
+      );
+      if (chk.rows[0]?.is_default) {
+        await ctx.answerCbQuery("Для этого элемента описание недоступно", { show_alert: false }).catch(() => {});
+        await showAdminAttestItem(ctx, itemId);
+        return;
+      }
       setState(ctx.from.id, { step: "attest_edit_desc", itemId });
 
       const keyboard = Markup.inlineKeyboard([
@@ -375,6 +403,15 @@ function registerAttest(bot, ensureUser, logError) {
       if (!isAdmin(user)) return;
 
       const itemId = parseInt(ctx.match[1], 10);
+      const chk = await pool.query(
+        "SELECT COALESCE(is_default, FALSE) AS is_default FROM attestation_items WHERE id = $1",
+        [itemId]
+      );
+      if (chk.rows[0]?.is_default) {
+        await ctx.answerCbQuery("Этот элемент нельзя удалить", { show_alert: false }).catch(() => {});
+        await showAdminAttestItem(ctx, itemId);
+        return;
+      }
       await pool.query("DELETE FROM attestation_items WHERE id = $1", [itemId]);
       clearState(ctx.from.id);
       await showAdminAttestMenu(ctx);
@@ -398,11 +435,11 @@ function registerAttest(bot, ensureUser, logError) {
 
       if (state.step === "attest_new_title") {
         const insertRes = await pool.query(
-          `INSERT INTO attestation_items (title, order_index)
+          `INSERT INTO attestation_items (title, order_index, is_default, item_type)
            VALUES (
              $1,
              COALESCE((SELECT MAX(order_index)+1 FROM attestation_items), 1)
-           )
+           , FALSE, 'normal')
            RETURNING id`,
           [text]
         );

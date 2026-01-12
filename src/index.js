@@ -10,6 +10,7 @@ const registerAdminCardCommands = require("./bot/adminCards");
 const registerTheory = require("./bot/theory");
 const registerTrain = require("./bot/train");
 const registerAttest = require("./bot/attest");
+const registerTechcards = require("./bot/techcards");
 const {
   registerInternship,
   hasActiveInternshipSessionForTrainer,
@@ -134,6 +135,7 @@ registerAdminCardCommands(bot, ensureUser, logError);
 registerTheory(bot, ensureUser, logError);
 registerTrain(bot, ensureUser, logError);
 registerAttest(bot, ensureUser, logError);
+registerTechcards(bot, ensureUser, logError);
 registerInternship(bot, ensureUser, logError, showMainMenu);
 
 startOutboxWorker(bot);

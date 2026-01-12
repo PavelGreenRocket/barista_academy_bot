@@ -391,6 +391,7 @@ function registerAdminCommands(bot, ensureUser, logError) {
       const keyboard = Markup.inlineKeyboard([
         [Markup.button.callback("🔧 Темы", "admin_topics")],
         [Markup.button.callback("🔧 Элементы аттестации", "admin_attest_menu")],
+        [Markup.button.callback("🔧 Тех карта", "admin_techcards")],
         [
           Markup.button.callback(
             "🔧 Настроить стажировку",
