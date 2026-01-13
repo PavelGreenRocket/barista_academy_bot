@@ -8,7 +8,7 @@ const { deliver } = require("../utils/renderHelpers");
 const cardStates = new Map();
 
 function isAdmin(user) {
-  return user && user.role === "admin";
+  return user && user.role === "admin" || user.role === "super_admin";
 }
 
 function setCardState(userId, state) {

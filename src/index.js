@@ -5,6 +5,7 @@ require("dotenv").config();
 const { Telegraf, Markup } = require("telegraf");
 const pool = require("./db/pool");
 
+// Академия: админ-панель
 const registerAdminCommands = require("./bot/admin");
 const registerAdminCardCommands = require("./bot/adminCards");
 const registerTheory = require("./bot/theory");
@@ -88,9 +89,10 @@ async function showMainMenu(ctx) {
   keyboard.push([Markup.button.callback("📚 Теория", "user_theory")]);
   keyboard.push([Markup.button.callback("🎯 Тренировки", "user_train")]);
   keyboard.push([Markup.button.callback("✅ Аттестация", "user_attest")]);
+  keyboard.push([Markup.button.callback("📖 техкарта", "user_techcards")]);
 
   // 👉 кнопка процесса стажировки, если у админа есть активная сессия
-  if (isAdmin) {
+  if (user.role === "admin" || user.role === "super_admin") {
     const hasInternship = await hasActiveInternshipSessionForTrainer(user.id);
     if (hasInternship) {
       keyboard.push([
@@ -104,7 +106,7 @@ async function showMainMenu(ctx) {
 
   // 👉 НОВОЕ: кнопка "Запланировано собеседование", если у админа есть активные кандидаты
   // (оставляю как у тебя — сейчас запрос никуда не выводится, но и не ломает)
-  if (isAdmin) {
+  if (user.role === "admin" || user.role === "super_admin") {
     await pool.query(
       `
       SELECT 1
@@ -118,7 +120,7 @@ async function showMainMenu(ctx) {
   }
 
   // переход в админ-панель
-  if (isAdmin) {
+if (user.role === "admin" || user.role === "super_admin") {
     keyboard.push([Markup.button.callback("🛠 Админ-панель", "admin_menu")]);
   }
 

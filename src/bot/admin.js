@@ -9,7 +9,7 @@ const adminStates = new Map();
 const topicPdfUploadState = new Map();
 
 function isAdmin(user) {
-  return user && user.role === "admin";
+  return user && user.role === "admin" || user.role === "super_admin";
 }
 function setState(userId, state) {
   adminStates.set(userId, state);
