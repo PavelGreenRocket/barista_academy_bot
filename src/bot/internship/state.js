@@ -19,7 +19,7 @@ const finishSessionStates = new Map(); // key: adminTelegramId → { mode, sessi
 const internshipCommentStates = new Map(); // key: adminTelegramId → { sessionId, userId }
 
 function isAdmin(user) {
-  return user && user.role === "admin" || user.role === "super_admin" || user.role === "super_admin";
+  return user && user.role === "admin" || user.role === "super_admin";
 }
 
 function isTelegraphUrl(url) {

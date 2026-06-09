@@ -105,6 +105,7 @@ async function showUserTechcardsHome(ctx) {
     [Markup.button.switchToCurrentChat("📁 Выбрать группу", "#spisokGroup ")],
     [Markup.button.switchToCurrentChat("🔎 Общий поиск", "#spisokMenu ")],
     [Markup.button.callback("🏁 Приступить к тренировке", "utc_train_menu")],
+    [Markup.button.callback(\"⬅️ Назад\", \"back_main\")],
   ]);
 
   await deliver(ctx, { text, extra: keyboard }, { edit: true });

@@ -64,9 +64,44 @@ async function showTrainMenu(ctx, userId, targetUserId = null) {
 
   const levelInfo = await getUserTrainLevelInfo(realUserId);
 
+  // Экзамены по теории:
+  // 📘 base: только ⭐ (difficulty=1)
+  // 📕 advanced: ⭐⭐ и ⭐⭐⭐ (difficulty IN 2,3)
+  let examBasePassed = false;
+  let examAdvancedPassed = false;
+  try {
+    const passRes = await pool.query(
+      `SELECT level FROM theory_exam_passes WHERE user_id = $1`,
+      [realUserId]
+    );
+    for (const r of passRes.rows) {
+      if (r.level === "base") examBasePassed = true;
+      if (r.level === "advanced") examAdvancedPassed = true;
+    }
+  } catch (_) {
+    // таблицы может не быть до миграции — просто не показываем статусы
+  }
+
+  const examStatusLines = [];
+  if (examBasePassed) examStatusLines.push("готов к сдаче 📘");
+  if (examAdvancedPassed) examStatusLines.push("готов к сдаче 📕");
+
+  let examButtonLabel = "📘 Пройти тестовый экзамен";
+  let examButtonAction = "theory_exam_base";
+  if (examBasePassed && !examAdvancedPassed) {
+    examButtonLabel = "📕 Пройти тестовый экзамен";
+    examButtonAction = "theory_exam_adv";
+  } else if (examBasePassed && examAdvancedPassed) {
+    examButtonLabel = "📕 Пройти тестовый экзамен";
+    examButtonAction = "theory_exam_done";
+  }
+
   const text =
     "🎯 Тренировки\n" +
     `(${levelInfo.levelLabel})\n\n` +
+    (examStatusLines.length
+      ? `Статус: ${examStatusLines.join(" / ")}\n\n`
+      : "") +
     "Выбери режим:\n" +
     "• Тест по одной теме\n" +
     "• Тест по всем темам\n" +
@@ -74,13 +109,13 @@ async function showTrainMenu(ctx, userId, targetUserId = null) {
     "• История твоих тестов";
 
   const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback(examButtonLabel, examButtonAction)],
     [Markup.button.callback("🧩 Тест по теме", "train_by_topic")],
     [Markup.button.callback("🌍 Тест по всем темам", "train_all_topics")],
     [Markup.button.callback("⚠️ Тесты по ошибкам", "train_mistakes")],
     [Markup.button.callback("📜 История тестов", "train_history")],
     [Markup.button.callback("🔙 В главное меню", "back_main")],
   ]);
-
   await deliver(ctx, { text, extra: keyboard }, { edit: true });
 }
 
@@ -246,7 +281,7 @@ async function loadCardsDetails(cardPairs) {
   if (!ids.length) return [];
 
   const res = await pool.query(
-    "SELECT id, question, answer, difficulty FROM cards WHERE id = ANY($1)",
+    "SELECT c.id, c.question, c.answer, c.difficulty, b.title AS block_title FROM cards c LEFT JOIN blocks b ON b.id = c.block_id WHERE c.id = ANY($1)",
     [ids]
   );
 
@@ -263,6 +298,7 @@ async function loadCardsDetails(cardPairs) {
       return {
         id: row.id,
         blockId: p.blockId,
+        blockTitle: row.block_title || null,
         question: row.question,
         answer: row.answer,
         difficulty: row.difficulty || 1,
@@ -294,7 +330,9 @@ async function renderCurrentTrainCard(ctx, userId) {
   const levelIcon = level === 1 ? "⭐" : level === 2 ? "⭐⭐" : "⭐⭐⭐";
 
   let text =
-    `${levelIcon} Вопрос ${humanIndex}/${total}\n\n` + `❓ ${card.question}`;
+    `${levelIcon} Вопрос ${humanIndex}/${total}\n` +
+    `Блок: ${card.blockTitle || "—"}\n\n` +
+    `❓ ${card.question}`;
 
   if (showAnswer) {
     text += `\n\n💡 Ответ:\n${card.answer}\n\n`;
@@ -336,6 +374,158 @@ function registerTrain(bot, ensureUser, logError) {
     } catch (err) {
       logError("user_train", err);
       await ctx.reply("Не удалось открыть тренировки. Попробуй позже.");
+    }
+  });
+  // Экзамены по теории: 📘 (⭐) и 📕 (⭐⭐+⭐⭐⭐)
+  bot.action("theory_exam_done", async (ctx) => {
+    await ctx
+      .answerCbQuery("Все экзамены по теории сданы", { show_alert: false })
+      .catch(() => {});
+  });
+
+  bot.action("theory_exam_base", async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+
+      const targetUserId = ctx.session?.adminTestingUser || admin.id;
+      const conductedBy = ctx.session?.adminTestingUser ? admin.id : null;
+
+      clearTrainSession(ctx.from.id);
+
+      const blocks = await getAllBlocks();
+      if (!blocks.length) {
+        await ctx.reply("Пока нет ни одного блока с теорией.");
+        return;
+      }
+
+      const allowed = [1]; // ⭐
+      const cardPairs = [];
+      for (const b of blocks) {
+        const ids = await getCardsByBlock(b.id, allowed);
+        for (const id of ids) {
+          cardPairs.push({ cardId: id, blockId: b.id });
+        }
+      }
+
+      if (!cardPairs.length) {
+        await ctx.reply("Пока нет ни одной карточки.");
+        return;
+      }
+
+      shuffleInPlace(cardPairs);
+      const picked = cardPairs.slice(0, 50);
+
+      const cards = await loadCardsForSession(picked);
+      if (!cards.length) {
+        await ctx.reply("Не удалось собрать вопросы для экзамена.");
+        return;
+      }
+
+      const sessionRes = await pool.query(
+        `INSERT INTO test_sessions (user_id, mode, topic_id, question_count, correct_count, conducted_by)
+         VALUES ($1, 'exam_base', NULL, $2, 0, $3)
+         RETURNING id`,
+        [targetUserId, cards.length, conductedBy]
+      );
+
+      const sessionId = sessionRes.rows[0].id;
+
+      setTrainSession(ctx.from.id, {
+        sessionId,
+        mode: "exam_base",
+        cards,
+        index: 0,
+        showAnswer: false,
+        correctCount: 0,
+      });
+
+      await renderCurrentTrainCard(ctx, ctx.from.id);
+    } catch (err) {
+      logError("theory_exam_base", err);
+      await ctx.reply("Не удалось запустить экзамен 📘.");
+    }
+  });
+
+  bot.action("theory_exam_adv", async (ctx) => {
+    try {
+      await ctx.answerCbQuery().catch(() => {});
+      const admin = await ensureUser(ctx);
+
+      const targetUserId = ctx.session?.adminTestingUser || admin.id;
+      const conductedBy = ctx.session?.adminTestingUser ? admin.id : null;
+
+      // проверим, что базовый экзамен уже зачтён
+      try {
+        const passRes = await pool.query(
+          `SELECT 1 FROM theory_exam_passes WHERE user_id = $1 AND level = 'base' LIMIT 1`,
+          [targetUserId]
+        );
+        if (!passRes.rows.length) {
+          await ctx
+            .answerCbQuery("Сначала нужно сдать базовый экзамен 📘", {
+              show_alert: false,
+            })
+            .catch(() => {});
+          return;
+        }
+      } catch (_) {}
+
+      clearTrainSession(ctx.from.id);
+
+      const blocks = await getAllBlocks();
+      if (!blocks.length) {
+        await ctx.reply("Пока нет ни одного блока с теорией.");
+        return;
+      }
+
+      const allowed = [2, 3]; // ⭐⭐ + ⭐⭐⭐
+      const cardPairs = [];
+      for (const b of blocks) {
+        const ids = await getCardsByBlock(b.id, allowed);
+        for (const id of ids) {
+          cardPairs.push({ cardId: id, blockId: b.id });
+        }
+      }
+
+      if (!cardPairs.length) {
+        await ctx.reply(
+          "Пока нет ни одной карточки для продвинутого экзамена."
+        );
+        return;
+      }
+
+      shuffleInPlace(cardPairs);
+      const picked = cardPairs.slice(0, 50);
+
+      const cards = await loadCardsForSession(picked);
+      if (!cards.length) {
+        await ctx.reply("Не удалось собрать вопросы для экзамена.");
+        return;
+      }
+
+      const sessionRes = await pool.query(
+        `INSERT INTO test_sessions (user_id, mode, topic_id, question_count, correct_count, conducted_by)
+         VALUES ($1, 'exam_adv', NULL, $2, 0, $3)
+         RETURNING id`,
+        [targetUserId, cards.length, conductedBy]
+      );
+
+      const sessionId = sessionRes.rows[0].id;
+
+      setTrainSession(ctx.from.id, {
+        sessionId,
+        mode: "exam_adv",
+        cards,
+        index: 0,
+        showAnswer: false,
+        correctCount: 0,
+      });
+
+      await renderCurrentTrainCard(ctx, ctx.from.id);
+    } catch (err) {
+      logError("theory_exam_adv", err);
+      await ctx.reply("Не удалось запустить экзамен 📕.");
     }
   });
 
@@ -660,12 +850,43 @@ function registerTrain(bot, ensureUser, logError) {
         const correct = session.correctCount;
         const percent = total > 0 ? Math.round((correct / total) * 100) : 0;
 
+        // если это экзамен по теории — фиксируем зачёт
+        let examNote = "";
+        try {
+          if (session.mode === "exam_base" || session.mode === "exam_adv") {
+            const passed = total > 0 && percent >= 95;
+            const level = session.mode === "exam_base" ? "base" : "advanced";
+            const label = level === "base" ? "📘" : "📕";
+
+            const uRes = await pool.query(
+              `SELECT id FROM users WHERE telegram_id = $1 LIMIT 1`,
+              [ctx.from.id]
+            );
+            const dbUserId = uRes.rows[0]?.id;
+
+            if (dbUserId) {
+              if (passed) {
+                await pool.query(
+                  `INSERT INTO theory_exam_passes (user_id, level, session_id, score)
+                   VALUES ($1, $2, $3, $4)
+                   ON CONFLICT (user_id, level)
+                   DO UPDATE SET session_id = EXCLUDED.session_id, score = EXCLUDED.score, passed_at = now()`,
+                  [dbUserId, level, sessionId, percent]
+                );
+                examNote = `\n\n✅ Экзамен ${label} зачтён.`;
+              } else {
+                examNote = `\n\n❌ Экзамен ${label} не зачтён (нужно ≥95%).`;
+              }
+            }
+          }
+        } catch (_) {}
+
         clearTrainSession(ctx.from.id);
 
         const text =
           "✅ Тест завершён.\n\n" +
-          `Результат: ${correct} из ${total} (${percent}%).`;
-
+          `Результат: ${correct} из ${total} (${percent}%).` +
+          examNote;
         const keyboard = Markup.inlineKeyboard([
           [Markup.button.callback("🎯 Ещё тест", "user_train")],
           [Markup.button.callback("🔙 В главное меню", "back_main")],
